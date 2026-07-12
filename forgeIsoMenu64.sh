@@ -73,7 +73,7 @@ declare -A REPO_URL=(
     [bastion-antiviral]="https://github.com/Bolo101/Bastion-Antiviral.git"
 )
 declare -A REPO_CODE_SUBDIR=(
-    [shadowclone]="code_installer"
+    [shadowclone]="code"
     [e-broyeur]="code"
     [virtupack]="code"
     [bastion-antiviral]="code"
