@@ -4,7 +4,7 @@
 
 SCRIPT_ISO   := forgeIsoMenu64.sh
 BUILD_DIR    := ./debian-live-build
-REPOS_DIR    := ./menu_selector
+REPOS_DIR    := ./repos-src
 ISO_FILE     := borne-multiservices-v1.0.iso
 
 .PHONY: all clean distclean help
