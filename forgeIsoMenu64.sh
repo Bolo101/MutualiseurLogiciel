@@ -13,15 +13,17 @@
 # ║    - Un menu Tkinter plein écran (menu_selector/main.py) est le point         ║
 # ║      d'entrée unique de la session kiosque. Il lance l'appli choisie en       ║
 # ║      sous-processus et réaffiche le menu à sa fermeture.                     ║
-# ║    - Chaque application appelle `poweroff` / `systemctl poweroff` pour        ║
-# ║      s'éteindre (comportement natif, inchangé). Ces appels sont              ║
-# ║      interceptés par des shims (/usr/local/sbin/{poweroff,halt,shutdown}      ║
-# ║      et /usr/local/bin/systemctl) qui les convertissent en `systemctl         ║
-# ║      reboot` : la borne redémarre et retombe sur le menu, elle ne s'éteint    ║
-# ║      jamais réellement toute seule.                                          ║
-# ║    - Une extinction réelle reste possible depuis le menu (bouton             ║
-# ║      "Maintenance", protégé par mot de passe), qui appelle le vrai            ║
-# ║      systemctl par chemin absolu (hors PATH, donc non intercepté).            ║
+# ║    - Chaque application dispose de son PROPRE bouton "Redémarrer" (ajouté    ║
+# ║      directement dans le code des 4 applications, hors périmètre de ce       ║
+# ║      script) pour revenir au menu. Ce wrapper n'intercepte plus aucune        ║
+# ║      commande système (aucun shim poweroff/systemctl).                       ║
+# ║    - L'extinction RÉELLE de la borne se fait exclusivement depuis le          ║
+# ║      panneau d'Administration du menu, protégé par mot de passe               ║
+# ║      (/etc/kiosk-menu/admin.pass), via `systemctl poweroff` en chemin        ║
+# ║      absolu.                                                                  ║
+# ║    - Ce même panneau d'Administration permet d'activer/désactiver chaque     ║
+# ║      bouton du menu principal (/etc/kiosk-menu/apps_state.json). Un          ║
+# ║      bouton désactivé apparaît grisé et ne lance plus rien au clic.          ║
 # ║                                                                                ║
 # ║  Spécificités préservées par appli :                                          ║
 # ║    - VirtuPack   : qemu.conf (user/group=root) + ACL cgroup pour disques      ║
@@ -60,26 +62,65 @@ set -euo pipefail
 
 # ── Variables ─────────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ISO_NAME="$(pwd)/borne-multiservices-v1.0.iso"
 WORK_DIR="$(pwd)/debian-live-build"
-REPOS_DIR="$(pwd)/code"
+REPOS_DIR="$(pwd)/repos-src"
 
-# Sources des 4 applications. Chaque entrée : "url|sous-dossier-code|nom-app"
-# shadowClone est le seul dont le code vit dans code_installer/ (pas code/).
 declare -A REPO_URL=(
     [shadowclone]="https://github.com/Bolo101/shadowClone.git"
     [e-broyeur]="https://github.com/Bolo101/e-Broyeur.git"
     [virtupack]="https://github.com/Bolo101/VirtuPack.git"
     [bastion-antiviral]="https://github.com/Bolo101/Bastion-Antiviral.git"
 )
-declare -A REPO_CODE_SUBDIR=(
-    [shadowclone]="code"
-    [e-broyeur]="code"
-    [virtupack]="code"
-    [bastion-antiviral]="code"
-)
 
 SIGBASE_URL="https://github.com/Neo23x0/signature-base/archive/refs/heads/master.zip"
+
+# ── Choix du mode : borne AVEC ou SANS authentification ──────────────────────
+# Chaque dépôt amont contient (au plus) deux variantes du code :
+#   code/            → pas de panneau admin protégé par mot de passe
+#   code_installer/  → panneau admin protégé par mot de passe (config_manager,
+#                      admin_interface, prompt du mot de passe au 1er lancement)
+#
+# Exceptions (un seul choix possible, quel que soit le mode demandé) :
+#   - shadowClone n'existe QUE dans sa variante code_installer/ (avec
+#     authentification) dans le dépôt amont : il n'y a pas de version code/.
+#   - Bastion-Antiviral n'existe QUE dans sa variante code/, mais celle-ci
+#     inclut déjà nativement l'authentification (admin_auth.py) : il n'y a
+#     pas de version code_installer/ séparée.
+# Le mode choisi ne s'applique donc réellement qu'à e-Broyeur et VirtuPack.
+MODE="${1:-}"
+case "$MODE" in
+    --auth|auth)       MODE="auth" ;;
+    --no-auth|noauth)  MODE="noauth" ;;
+    "")
+        echo "Quel mode pour cette borne ?"
+        echo "  1) Avec authentification (panneau admin protégé par mot de passe)"
+        echo "  2) Sans authentification (accès direct, pas de panneau admin)"
+        read -rp "Choix [1/2] : " CHOICE
+        case "$CHOICE" in
+            1) MODE="auth" ;;
+            2) MODE="noauth" ;;
+            *) echo "Choix invalide (attendu : 1 ou 2)" >&2; exit 1 ;;
+        esac
+        ;;
+    *) echo "Argument invalide : $MODE (attendu : --auth ou --no-auth)" >&2; exit 1 ;;
+esac
+
+declare -A REPO_CODE_SUBDIR
+for _app in shadowclone e-broyeur virtupack bastion-antiviral; do
+    case "$_app" in
+        shadowclone)        REPO_CODE_SUBDIR[$_app]="code_installer" ;;
+        bastion-antiviral)  REPO_CODE_SUBDIR[$_app]="code" ;;
+        *)
+            if [[ "$MODE" == "auth" ]]; then
+                REPO_CODE_SUBDIR[$_app]="code_installer"
+            else
+                REPO_CODE_SUBDIR[$_app]="code"
+            fi
+            ;;
+    esac
+done
+
+ISO_NAME="$(pwd)/borne-multiservices-v1.0-${MODE}.iso"
 
 # Paramètres de boot communs (réutilisés dans syslinux + GRUB)
 BOOT_PARAMS="boot=live components quiet splash hostname=borne-multiservices username=kiosk locales=fr_FR.UTF-8 keyboard-layouts=fr noeject nopersistent"
@@ -100,12 +141,21 @@ done
 
 [[ -f "$SCRIPT_DIR/menu_selector/main.py" ]] \
     || err "menu_selector/main.py introuvable à côté de ce script (${SCRIPT_DIR})"
-[[ -d "$SCRIPT_DIR/shims" ]] \
-    || err "Dossier shims/ introuvable à côté de ce script (${SCRIPT_DIR})"
-for shim in poweroff-shim.sh shutdown-shim.sh systemctl-shim.sh; do
-    [[ -f "$SCRIPT_DIR/shims/$shim" ]] || err "Shim manquant : shims/$shim"
-done
 ok "Pré-requis OK"
+
+# ── Récapitulatif du mode choisi ──────────────────────────────────────────────
+step "Mode sélectionné : ${MODE}"
+if [[ "$MODE" == "auth" ]]; then
+    echo "  Borne AVEC authentification (panneau admin protégé par mot de passe)"
+else
+    echo "  Borne SANS authentification (accès direct, pas de panneau admin)"
+fi
+echo "  Sous-dossier retenu par application :"
+for _app in shadowclone e-broyeur virtupack bastion-antiviral; do
+    printf "    %-20s -> %s\n" "$_app" "${REPO_CODE_SUBDIR[$_app]}"
+done
+warn "shadowClone n'existe qu'en version authentifiée en amont (code_installer/) : le mode choisi ne change rien pour lui."
+warn "Bastion-Antiviral n'existe qu'en version code/, mais celle-ci inclut déjà nativement l'authentification (admin_auth.py)."
 
 # ── Récupération / mise à jour des 4 dépôts sources ───────────────────────────
 step "Récupération des 4 dépôts applicatifs..."
@@ -721,12 +771,33 @@ chmod -R 755 /var/lib/yara-rules
 mkdir -p /opt/pdf && chmod 775 /opt/pdf && chown kiosk:kiosk /opt/pdf 2>/dev/null || true
 mkdir -p /opt/img && chmod 755 /opt/img
 
-# ── Mot de passe admin du menu (bouton Maintenance) ─────────────────────────
+# ── Mot de passe admin du menu (panneau Administration) ─────────────────────
 # Valeur par défaut à CHANGER IMPÉRATIVEMENT après le premier déploiement.
+# Le menu tourne en tant qu'utilisateur "kiosk" (pas root) : ce fichier doit
+# donc lui appartenir pour qu'il puisse le lire au moment de vérifier le
+# mot de passe saisi.
 if [[ ! -f /etc/kiosk-menu/admin.pass ]]; then
     echo "0000" > /etc/kiosk-menu/admin.pass
 fi
+chown kiosk:kiosk /etc/kiosk-menu/admin.pass
 chmod 600 /etc/kiosk-menu/admin.pass
+
+# ── État des boutons du menu principal (activé/désactivé par appli) ────────
+# Écrit/lu par le menu lui-même (utilisateur kiosk) depuis le panneau
+# d'Administration : doit donc lui appartenir également.
+if [[ ! -f /etc/kiosk-menu/apps_state.json ]]; then
+    cat > /etc/kiosk-menu/apps_state.json << 'JSON'
+{
+  "shadowclone": true,
+  "e-broyeur": true,
+  "virtupack": true,
+  "bastion-antiviral": true
+}
+JSON
+fi
+chown kiosk:kiosk /etc/kiosk-menu/apps_state.json
+chmod 644 /etc/kiosk-menu/apps_state.json
+chown kiosk:kiosk /etc/kiosk-menu
 
 # ── Wrappers de lancement (un par application, tous root via sudo) ─────────
 cat > /usr/local/bin/app-shadowclone << 'WRAPPER'
@@ -966,11 +1037,10 @@ done
 chmod 644 /opt/kiosk-menu/main.py 2>/dev/null || true
 chmod 755 /opt/kiosk-menu
 
-# Shims d'interception poweroff/halt/shutdown/systemctl
-for shim in /usr/local/sbin/poweroff /usr/local/sbin/halt \
-            /usr/local/sbin/shutdown /usr/local/bin/systemctl; do
-    [[ -f "$shim" ]] && chmod 755 "$shim"
-done
+# Fichiers d'état/administration du menu (doivent rester lisibles/inscriptibles par kiosk)
+[[ -f /etc/kiosk-menu/admin.pass ]] && chown kiosk:kiosk /etc/kiosk-menu/admin.pass && chmod 600 /etc/kiosk-menu/admin.pass
+[[ -f /etc/kiosk-menu/apps_state.json ]] && chown kiosk:kiosk /etc/kiosk-menu/apps_state.json && chmod 644 /etc/kiosk-menu/apps_state.json
+chown kiosk:kiosk /etc/kiosk-menu 2>/dev/null || true
 
 # ClamAV – bases officielles + signatures tierces
 mkdir -p /var/lib/clamav /var/log/clamav /var/run/clamav
@@ -1045,7 +1115,7 @@ chmod +x config/hooks/normal/0400-permissions.hook.chroot
 ok "Hook permissions créé"
 
 # =============================================================================
-# Copie du code des 4 applications + du menu + des shims
+# Copie du code des 4 applications + du menu de sélection
 # =============================================================================
 step "Copie du code des 4 applications dans le chroot..."
 for app in shadowclone e-broyeur virtupack bastion-antiviral; do
@@ -1060,14 +1130,6 @@ step "Copie du menu de sélection..."
 mkdir -p config/includes.chroot/opt/kiosk-menu
 cp "$SCRIPT_DIR/menu_selector/main.py" config/includes.chroot/opt/kiosk-menu/main.py
 ok "Menu copié"
-
-step "Installation des shims poweroff/halt/shutdown/systemctl..."
-mkdir -p config/includes.chroot/usr/local/sbin config/includes.chroot/usr/local/bin
-install -m 755 "$SCRIPT_DIR/shims/poweroff-shim.sh" config/includes.chroot/usr/local/sbin/poweroff
-install -m 755 "$SCRIPT_DIR/shims/poweroff-shim.sh" config/includes.chroot/usr/local/sbin/halt
-install -m 755 "$SCRIPT_DIR/shims/shutdown-shim.sh" config/includes.chroot/usr/local/sbin/shutdown
-install -m 755 "$SCRIPT_DIR/shims/systemctl-shim.sh" config/includes.chroot/usr/local/bin/systemctl
-ok "Shims installés (interception poweroff/halt/shutdown/systemctl -> reboot)"
 
 # =============================================================================
 # Menus de boot (syslinux BIOS + GRUB UEFI) – 2 entrées
@@ -1218,10 +1280,12 @@ echo "╔═══════════════════════�
 echo -e "${GREEN}║  🎉  BUILD TERMINÉ AVEC SUCCÈS${RESET}"
 echo "╠══════════════════════════════════════════════════════════════╣"
 echo "║  ISO         : $ISO_NAME"
+echo "║  Mode        : $MODE (code_installer/ ou code/ selon appli, cf. avertissements)"
 echo "║  Taille      : $ISO_SIZE"
 echo "║  Clavier     : AZERTY (fr)"
 echo "║  Autologin   : kiosk  (sudo sans mot de passe)"
-echo "║  Mot de passe Maintenance (menu) : 0000  (À CHANGER !)"
+echo "║  Mot de passe Administration (menu) : 0000  (À CHANGER !)"
+echo "║    -> fichier : /etc/kiosk-menu/admin.pass"
 echo "╠══════════════════════════════════════════════════════════════╣"
 echo "║  MENU DE DÉMARRAGE (BIOS syslinux + UEFI GRUB) :             ║"
 echo "║    1. Demarrer (menu de selection)                          ║"
@@ -1233,10 +1297,15 @@ echo "║    - Broyeur de disque       (e-Broyeur)                    ║"
 echo "║    - Machine virtuelle (P2V) (VirtuPack)                    ║"
 echo "║    - Antivirus USB           (Bastion-Antiviral)             ║"
 echo "╠══════════════════════════════════════════════════════════════╣"
-echo "║  GESTION DE L'EXTINCTION :                                   ║"
-echo "║    poweroff / systemctl poweroff / halt / shutdown appelés   ║"
-echo "║    par une application -> convertis en reboot (retour menu). ║"
-echo "║    Extinction reelle : menu -> Maintenance (mot de passe).   ║"
+echo "║  PANNEAU D'ADMINISTRATION DU MENU (bouton en bas à droite) : ║"
+echo "║    - Active/désactive chaque bouton du menu principal        ║"
+echo "║      (bouton grisé si désactivé, ne lance plus rien).        ║"
+echo "║      -> état stocké dans /etc/kiosk-menu/apps_state.json     ║"
+echo "║    - Redémarrage ou extinction RÉELLE de la borne             ║"
+echo "║      (systemctl reboot/poweroff en chemin absolu).           ║"
+echo "║  Le retour au menu depuis une application se fait via le      ║"
+echo "║  bouton Redémarrer propre à chaque application (aucune        ║"
+echo "║  interception système n'est utilisée par ce wrapper).        ║"
 echo "╠══════════════════════════════════════════════════════════════╣"
 echo "║  Pour flasher sur une clé USB :                              ║"
 echo "║    sudo dd if=$ISO_NAME of=/dev/sdX bs=4M status=progress    ║"
