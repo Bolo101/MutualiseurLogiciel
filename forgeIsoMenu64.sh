@@ -74,53 +74,21 @@ declare -A REPO_URL=(
 
 SIGBASE_URL="https://github.com/Neo23x0/signature-base/archive/refs/heads/master.zip"
 
-# ── Choix du mode : borne AVEC ou SANS authentification ──────────────────────
-# Chaque dépôt amont contient (au plus) deux variantes du code :
-#   code/            → pas de panneau admin protégé par mot de passe
-#   code_installer/  → panneau admin protégé par mot de passe (config_manager,
-#                      admin_interface, prompt du mot de passe au 1er lancement)
-#
-# Exceptions (un seul choix possible, quel que soit le mode demandé) :
-#   - shadowClone n'existe QUE dans sa variante code_installer/ (avec
-#     authentification) dans le dépôt amont : il n'y a pas de version code/.
-#   - Bastion-Antiviral n'existe QUE dans sa variante code/, mais celle-ci
-#     inclut déjà nativement l'authentification (admin_auth.py) : il n'y a
-#     pas de version code_installer/ séparée.
-# Le mode choisi ne s'applique donc réellement qu'à e-Broyeur et VirtuPack.
-MODE="${1:-}"
-case "$MODE" in
-    --auth|auth)       MODE="auth" ;;
-    --no-auth|noauth)  MODE="noauth" ;;
-    "")
-        echo "Quel mode pour cette borne ?"
-        echo "  1) Avec authentification (panneau admin protégé par mot de passe)"
-        echo "  2) Sans authentification (accès direct, pas de panneau admin)"
-        read -rp "Choix [1/2] : " CHOICE
-        case "$CHOICE" in
-            1) MODE="auth" ;;
-            2) MODE="noauth" ;;
-            *) echo "Choix invalide (attendu : 1 ou 2)" >&2; exit 1 ;;
-        esac
-        ;;
-    *) echo "Argument invalide : $MODE (attendu : --auth ou --no-auth)" >&2; exit 1 ;;
-esac
+# ── Sous-dossier de code retenu par application ──────────────────────────────
+# shadowClone, e-Broyeur et VirtuPack : leur code utile vit dans
+# code_installer/ (panneau admin protégé par mot de passe inclus,
+# config_manager, etc.).
+# Bastion-Antiviral : son code vit dans code/ (il inclut déjà nativement
+# l'authentification via admin_auth.py, il n'y a pas de code_installer/
+# séparé dans ce dépôt).
+declare -A REPO_CODE_SUBDIR=(
+    [shadowclone]="code_installer"
+    [e-broyeur]="code_installer"
+    [virtupack]="code_installer"
+    [bastion-antiviral]="code"
+)
 
-declare -A REPO_CODE_SUBDIR
-for _app in shadowclone e-broyeur virtupack bastion-antiviral; do
-    case "$_app" in
-        shadowclone)        REPO_CODE_SUBDIR[$_app]="code_installer" ;;
-        bastion-antiviral)  REPO_CODE_SUBDIR[$_app]="code" ;;
-        *)
-            if [[ "$MODE" == "auth" ]]; then
-                REPO_CODE_SUBDIR[$_app]="code_installer"
-            else
-                REPO_CODE_SUBDIR[$_app]="code"
-            fi
-            ;;
-    esac
-done
-
-ISO_NAME="$(pwd)/borne-multiservices-v1.0-${MODE}.iso"
+ISO_NAME="$(pwd)/borne-multiservices-v1.0.iso"
 
 # Paramètres de boot communs (réutilisés dans syslinux + GRUB)
 BOOT_PARAMS="boot=live components quiet splash hostname=borne-multiservices username=kiosk locales=fr_FR.UTF-8 keyboard-layouts=fr noeject nopersistent"
@@ -143,19 +111,11 @@ done
     || err "menu_selector/main.py introuvable à côté de ce script (${SCRIPT_DIR})"
 ok "Pré-requis OK"
 
-# ── Récapitulatif du mode choisi ──────────────────────────────────────────────
-step "Mode sélectionné : ${MODE}"
-if [[ "$MODE" == "auth" ]]; then
-    echo "  Borne AVEC authentification (panneau admin protégé par mot de passe)"
-else
-    echo "  Borne SANS authentification (accès direct, pas de panneau admin)"
-fi
-echo "  Sous-dossier retenu par application :"
+# ── Récapitulatif des sous-dossiers de code retenus ──────────────────────────
+step "Sous-dossier de code retenu par application :"
 for _app in shadowclone e-broyeur virtupack bastion-antiviral; do
     printf "    %-20s -> %s\n" "$_app" "${REPO_CODE_SUBDIR[$_app]}"
 done
-warn "shadowClone n'existe qu'en version authentifiée en amont (code_installer/) : le mode choisi ne change rien pour lui."
-warn "Bastion-Antiviral n'existe qu'en version code/, mais celle-ci inclut déjà nativement l'authentification (admin_auth.py)."
 
 # ── Récupération / mise à jour des 4 dépôts sources ───────────────────────────
 step "Récupération des 4 dépôts applicatifs..."
@@ -1280,7 +1240,8 @@ echo "╔═══════════════════════�
 echo -e "${GREEN}║  🎉  BUILD TERMINÉ AVEC SUCCÈS${RESET}"
 echo "╠══════════════════════════════════════════════════════════════╣"
 echo "║  ISO         : $ISO_NAME"
-echo "║  Mode        : $MODE (code_installer/ ou code/ selon appli, cf. avertissements)"
+echo "║  Code retenu : code_installer/ (shadowClone, e-Broyeur, VirtuPack)"
+echo "║                code/ (Bastion-Antiviral)"
 echo "║  Taille      : $ISO_SIZE"
 echo "║  Clavier     : AZERTY (fr)"
 echo "║  Autologin   : kiosk  (sudo sans mot de passe)"
