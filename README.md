@@ -79,14 +79,29 @@ Ce wrapper retient systématiquement :
   Business (installation best-effort, licence à activer séparément) repris
   du script d'origine.
 
+## Menu de démarrage
+
+Le menu de démarrage (syslinux BIOS + GRUB UEFI) propose 3 entrées :
+
+1. **Démarrer** (menu de sélection) — mode live normal.
+2. **Installer sur le disque (kiosque persistant)** — copie (rsync) tout le
+   système live sur un disque interne : les 4 applications, le menu, ClamAV/
+   YARA/Avast et la configuration libvirt sont installés tels quels. Le
+   système installé démarre ensuite directement sur le même menu de
+   sélection (session `xfwm4`, plus robuste qu'OpenBox pour un usage
+   pérenne). L'installateur (`/usr/local/bin/install-to-disk.sh`, whiptail)
+   demande le disque cible, partitionne (GPT+ESP en UEFI, MBR en BIOS),
+   formate, copie le système, régénère `/etc/fstab`, installe GRUB et
+   bascule l'autologin sur la session installée.
+3. **Démarrer - Sans échec (nomodeset)** — mode live avec pilote vidéo
+   générique, utile en cas d'écran noir dû à un pilote graphique.
+
 ## Simplifications assumées
 
-- Le menu de démarrage (syslinux BIOS + GRUB UEFI) ne garde que 2 entrées :
-  "Démarrer" et "Démarrer - Sans échec (nomodeset)". Les modes "Installer
-  sur disque" des 4 projets ne sont pas fusionnables tels quels (systèmes
-  de fichiers cibles et sessions installées différentes) et sortent du
-  périmètre de ce wrapper — chaque projet garde son propre installateur
-  autonome si besoin (dossier `iso/` de chaque dépôt).
+- Un seul mode d'installation, générique (rsync du système live complet),
+  au lieu d'un installateur distinct par application. Cela évite de gérer
+  quatre logiques d'installation différentes alors que le contenu à copier
+  est strictement le même (le système live entier).
 - Le pré-check réseau Avast côté machine de build (présent dans le script
   d'origine de Bastion-Antiviral) est retiré : le hook d'installation
   suffit et gère déjà tous les cas d'échec réseau proprement.
