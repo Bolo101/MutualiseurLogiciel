@@ -41,11 +41,10 @@
 # ║                    (pas code/) — c'est le seul des 4 dans ce cas.             ║
 # ║                                                                                ║
 # ║  Simplifications assumées par rapport aux scripts d'origine :                 ║
-# ║    - Menu de boot réduit à 2 entrées (Live / Live sans échec) : les modes     ║
-# ║      "Installer sur disque" des 4 projets ne sont pas unifiables tels         ║
-# ║      quels (systèmes de fichiers cibles, sessions installées différentes)    ║
-# ║      et sortent du périmètre de ce wrapper. Chaque projet garde son propre    ║
-# ║      installateur autonome si besoin (iso/ de chaque dépôt).                 ║
+# ║    - Un seul mode "Installer sur disque", générique (rsync du système        ║
+# ║      live complet : 4 applications + menu + antivirus + libvirt), au lieu    ║
+# ║      d'un installateur par application. Le système installé démarre          ║
+# ║      directement sur le même menu de sélection (session xfwm4 dédiée).       ║
 # ║    - Le pré-check réseau Avast côté machine de build (config/archives) est    ║
 # ║      retiré : le hook 0250 (exécuté en chroot) suffit et gère déjà tous les  ║
 # ║      cas d'échec réseau proprement.                                          ║
@@ -231,8 +230,9 @@ python3-pip
 python3-pil
 python3-pil.imagetk
 python3-fitz
-# ── Outils disque/USB (e-Broyeur, shadowClone, VirtuPack) ───────────────────
+# ── Outils disque/USB (e-Broyeur, shadowClone, VirtuPack, installateur) ─────
 parted
+e2fsprogs
 ntfs-3g
 dosfstools
 exfatprogs
@@ -724,6 +724,7 @@ done
 mkdir -p /opt/kiosk-menu
 mkdir -p /etc/kiosk-menu
 mkdir -p /var/log/kiosk-menu
+chown kiosk:kiosk /var/log/kiosk-menu
 mkdir -p /mnt/avscan_usb && chmod 777 /mnt/avscan_usb
 mkdir -p /etc/virusscanner && chmod 700 /etc/virusscanner
 mkdir -p /var/lib/yara-rules/signature-base /var/lib/yara-rules/custom
@@ -849,17 +850,12 @@ HandleLidSwitchDocked=ignore
 IdleAction=ignore
 EOF
 
-# ── Session kiosque : lance le menu, relance en boucle sur crash ────────────
+# ── Session kiosque : dispatcher live / installateur ─────────────────────────
+# Appelée par LightDM via kiosk-menu.desktop. Lit /proc/cmdline : si
+# "installer=1" → lance l'installateur sur disque ; sinon → menu de
+# sélection en boucle (relance uniquement en cas de crash).
 cat > /usr/local/bin/kiosk-menu-session.sh << 'SESSION'
 #!/bin/bash
-# =============================================================================
-# kiosk-menu-session.sh – Session kiosque : point d'entrée unique
-#
-# Appelée par LightDM via kiosk-menu.desktop. Lance le menu de sélection en
-# boucle (relance uniquement en cas de crash, code retour != 0). Le menu
-# lui-même se recharge après chaque application ; cette boucle n'est qu'un
-# filet de sécurité supplémentaire.
-# =============================================================================
 export DISPLAY=:0
 export XDG_RUNTIME_DIR="/run/user/$(id -u)"
 
@@ -872,18 +868,55 @@ sleep 1
 
 xsetroot -solid black 2>/dev/null || true
 
+if grep -q "installer=1" /proc/cmdline 2>/dev/null; then
+    # ── Mode installateur ────────────────────────────────────────────────────
+    xterm -title "Borne Multiservices - Installation" \
+          -fa "Monospace" -fs 12 \
+          -bg "#0d0d1a" -fg "#e0e0e0" \
+          -e "sudo /usr/local/bin/install-to-disk.sh"
+else
+    # ── Mode live kiosque ────────────────────────────────────────────────────
+    while true; do
+        /usr/local/bin/kiosk-menu
+        [[ $? -eq 0 ]] && break
+        sleep 1
+    done
+
+    kill "$OB_PID" 2>/dev/null || true
+    exec xfce4-session
+fi
+
+kill "$OB_PID" 2>/dev/null || true
+SESSION
+chmod 755 /usr/local/bin/kiosk-menu-session.sh
+
+# ── Session pour le système INSTALLÉ (xfwm4, plus robuste en pérenne) ──────
+cat > /usr/local/bin/kiosk-menu-session-installed.sh << 'SESSION'
+#!/bin/bash
+export DISPLAY=:0
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+
+xset s off -dpms 2>/dev/null || true
+xset s noblank   2>/dev/null || true
+
+xsetroot -solid black 2>/dev/null || true
+
+xfwm4 --compositor=off &
+WM_PID=$!
+sleep 1
+
 while true; do
     /usr/local/bin/kiosk-menu
     [[ $? -eq 0 ]] && break
     sleep 1
 done
 
-kill "$OB_PID" 2>/dev/null || true
+kill "$WM_PID" 2>/dev/null || true
 exec xfce4-session
 SESSION
-chmod 755 /usr/local/bin/kiosk-menu-session.sh
+chmod 755 /usr/local/bin/kiosk-menu-session-installed.sh
 
-# ── Fichier .desktop pour LightDM (xsession) ─────────────────────────────────
+# ── Fichiers .desktop pour LightDM (xsessions) ───────────────────────────────
 mkdir -p /usr/share/xsessions
 cat > /usr/share/xsessions/kiosk-menu.desktop << 'XSESSION'
 [Desktop Entry]
@@ -891,6 +924,15 @@ Name=Borne Multiservices
 Comment=Menu de sélection (cloneur, broyeur, P2V, antivirus)
 Exec=/usr/local/bin/kiosk-menu-session.sh
 TryExec=/usr/local/bin/kiosk-menu-session.sh
+Type=Application
+XSESSION
+
+cat > /usr/share/xsessions/kiosk-menu-installed.desktop << 'XSESSION'
+[Desktop Entry]
+Name=Borne Multiservices (installée)
+Comment=Menu de sélection, système installé sur disque (xfwm4)
+Exec=/usr/local/bin/kiosk-menu-session-installed.sh
+TryExec=/usr/local/bin/kiosk-menu-session-installed.sh
 Type=Application
 XSESSION
 
@@ -909,6 +951,184 @@ cat > /etc/skel/.dmrc << 'DMRC'
 [Desktop]
 Session=kiosk-menu
 DMRC
+
+# ── Script install-to-disk.sh (rsync du système live complet, UEFI/BIOS) ────
+# Générique : installe TOUT le système live (4 applications + menu +
+# ClamAV/YARA/Avast + libvirt) sur le disque cible, quel que soit le
+# service que l'utilisateur comptait lancer. Adapté du mécanisme déjà
+# éprouvé de Bastion-Antiviral.
+cat > /usr/local/bin/install-to-disk.sh << 'INSTALLER'
+#!/bin/bash
+set -e
+
+TITLE="Borne Multiservices - Installation"
+TARGET_MNT="/mnt/kiosk-target"
+
+part() {
+    case "$1" in
+        *nvme*|*mmcblk*) echo "${1}p${2}" ;;
+        *)               echo "${1}${2}"  ;;
+    esac
+}
+
+# Détection des disques disponibles (exclure loop et le média live)
+LIVE_DEV=$(findmnt -n -o SOURCE / 2>/dev/null | sed 's|/dev/||;s|[0-9]*$||' || true)
+DISKS=$(lsblk -d -o NAME,SIZE,MODEL -n | grep -v "^loop" | grep -v "^${LIVE_DEV}" || true)
+
+if [ -z "$DISKS" ]; then
+    whiptail --title "$TITLE" --msgbox "Aucun disque cible détecté." 8 55
+    exit 1
+fi
+
+MENU_ARGS=()
+while IFS= read -r line; do
+    name=$(echo "$line" | awk '{print $1}')
+    rest=$(echo "$line" | awk '{$1=""; print $0}' | xargs)
+    MENU_ARGS+=("/dev/$name" "$rest")
+done <<< "$DISKS"
+
+TARGET=$(whiptail --title "$TITLE" \
+    --menu "Choisir le disque cible\n⚠  TOUTES LES DONNÉES SERONT EFFACÉES" \
+    20 72 10 "${MENU_ARGS[@]}" \
+    3>&1 1>&2 2>&3) || { echo "Installation annulée."; exit 0; }
+
+whiptail --title "$TITLE" --yesno \
+"⚠  AVERTISSEMENT FINAL
+
+Toutes les données sur $TARGET seront définitivement effacées.
+Le système sera installé en mode kiosque (démarrage automatique
+du menu de sélection des 4 applications).
+
+Confirmer l'installation sur $TARGET ?" \
+13 62 || { echo "Installation annulée."; exit 0; }
+
+UEFI=0
+[ -d /sys/firmware/efi ] && UEFI=1
+
+# ── Partitionnement ───────────────────────────────────────────────────────────
+whiptail --title "$TITLE" --infobox "Partitionnement de $TARGET..." 5 56
+wipefs -a "$TARGET"
+
+if [ "$UEFI" -eq 1 ]; then
+    parted -s "$TARGET" mklabel gpt
+    parted -s "$TARGET" mkpart ESP  fat32 1MiB 513MiB
+    parted -s "$TARGET" set 1 esp on
+    parted -s "$TARGET" mkpart root ext4 513MiB 100%
+    EFI_PART="$(part "$TARGET" 1)"
+    ROOT_PART="$(part "$TARGET" 2)"
+else
+    parted -s "$TARGET" mklabel msdos
+    parted -s "$TARGET" mkpart primary ext4 1MiB 100%
+    parted -s "$TARGET" set 1 boot on
+    ROOT_PART="$(part "$TARGET" 1)"
+fi
+
+# ── Formatage ─────────────────────────────────────────────────────────────────
+whiptail --title "$TITLE" --infobox "Formatage des partitions..." 5 50
+mkfs.ext4 -F "$ROOT_PART"
+[ "$UEFI" -eq 1 ] && mkfs.fat -F32 "$EFI_PART"
+
+# ── Montage ───────────────────────────────────────────────────────────────────
+whiptail --title "$TITLE" --infobox "Montage des partitions cibles..." 5 56
+mkdir -p "$TARGET_MNT"
+mount "$ROOT_PART" "$TARGET_MNT"
+[ "$UEFI" -eq 1 ] && { mkdir -p "$TARGET_MNT/boot/efi"; mount "$EFI_PART" "$TARGET_MNT/boot/efi"; }
+
+# ── Copie rsync (tout le système live : 4 apps + menu + antivirus + libvirt) ─
+whiptail --title "$TITLE" --infobox \
+    "Copie du système (4 applications + menu + antivirus)...\nCette étape dure plusieurs minutes." \
+    7 62
+rsync -aHAX \
+    --exclude=/proc   --exclude=/sys    --exclude=/dev  \
+    --exclude=/run    --exclude=/mnt    --exclude=/media \
+    --exclude=/tmp    --exclude=/live   \
+    / "$TARGET_MNT"/
+
+mkdir -p "$TARGET_MNT"/{proc,sys,dev,run,mnt,media,tmp}
+chmod 1777 "$TARGET_MNT/tmp"
+
+# ── fstab ─────────────────────────────────────────────────────────────────────
+ROOT_UUID=$(blkid -s UUID -o value "$ROOT_PART")
+{
+    echo "UUID=$ROOT_UUID  /          ext4  errors=remount-ro  0  1"
+    if [ "$UEFI" -eq 1 ]; then
+        EFI_UUID=$(blkid -s UUID -o value "$EFI_PART")
+        echo "UUID=$EFI_UUID  /boot/efi  vfat  umask=0077         0  1"
+    fi
+    echo "tmpfs  /tmp  tmpfs  defaults,nosuid,nodev  0  0"
+} > "$TARGET_MNT/etc/fstab"
+
+# ── Masquer les services live (inutiles sur le système installé) ─────────────
+for svc in live-boot live-config live-tools live-config-components; do
+    chroot "$TARGET_MNT" systemctl mask "$svc" 2>/dev/null || true
+done
+rm -f "$TARGET_MNT/etc/live/boot.conf" 2>/dev/null || true
+
+# ── LightDM : basculer sur la session "installée" (xfwm4 kiosque) ────────────
+mkdir -p "$TARGET_MNT/etc/lightdm/lightdm.conf.d"
+cat > "$TARGET_MNT/etc/lightdm/lightdm.conf.d/50-autologin.conf" << 'LIGHTDM_EOF'
+[Seat:*]
+autologin-user=kiosk
+autologin-session=kiosk-menu-installed
+autologin-user-timeout=0
+allow-guest=false
+LIGHTDM_EOF
+
+[ -f "$TARGET_MNT/etc/skel/.dmrc" ] && \
+cat > "$TARGET_MNT/etc/skel/.dmrc" << 'DMRC_EOF'
+[Desktop]
+Session=kiosk-menu-installed
+DMRC_EOF
+
+[ -f "$TARGET_MNT/home/kiosk/.dmrc" ] && \
+cat > "$TARGET_MNT/home/kiosk/.dmrc" << 'DMRC_EOF'
+[Desktop]
+Session=kiosk-menu-installed
+DMRC_EOF
+
+# ── GRUB ──────────────────────────────────────────────────────────────────────
+cat > "$TARGET_MNT/etc/default/grub" << 'GRUBCFG'
+GRUB_DEFAULT=0
+GRUB_TIMEOUT=3
+GRUB_DISTRIBUTOR="Borne Multiservices"
+GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"
+GRUB_CMDLINE_LINUX=""
+GRUBCFG
+
+whiptail --title "$TITLE" --infobox "Installation du chargeur d'amorçage GRUB..." 5 58
+mount --bind /dev  "$TARGET_MNT/dev"
+mount --bind /proc "$TARGET_MNT/proc"
+mount --bind /sys  "$TARGET_MNT/sys"
+[ "$UEFI" -eq 1 ] && \
+    mount --bind /sys/firmware/efi/efivars \
+                 "$TARGET_MNT/sys/firmware/efi/efivars" 2>/dev/null || true
+
+if [ "$UEFI" -eq 1 ]; then
+    chroot "$TARGET_MNT" grub-install \
+        --target=x86_64-efi \
+        --efi-directory=/boot/efi \
+        --bootloader-id=BorneMultiservices \
+        --recheck
+else
+    chroot "$TARGET_MNT" grub-install --target=i386-pc --recheck "$TARGET"
+fi
+chroot "$TARGET_MNT" update-grub
+
+umount "$TARGET_MNT/sys/firmware/efi/efivars" 2>/dev/null || true
+umount "$TARGET_MNT/sys"
+umount "$TARGET_MNT/proc"
+umount "$TARGET_MNT/dev"
+[ "$UEFI" -eq 1 ] && umount "$TARGET_MNT/boot/efi"
+umount "$TARGET_MNT"
+
+whiptail --title "$TITLE" --msgbox \
+"✅  Installation terminée !
+
+Retirez le support live et redémarrez : la borne démarrera
+directement sur le menu de sélection installé sur $TARGET." \
+10 62
+INSTALLER
+chmod 755 /usr/local/bin/install-to-disk.sh
 
 echo ">>> [Hook Système] OK ✅"
 HOOK
@@ -1001,6 +1221,7 @@ chmod 755 /opt/kiosk-menu
 [[ -f /etc/kiosk-menu/admin.pass ]] && chown kiosk:kiosk /etc/kiosk-menu/admin.pass && chmod 600 /etc/kiosk-menu/admin.pass
 [[ -f /etc/kiosk-menu/apps_state.json ]] && chown kiosk:kiosk /etc/kiosk-menu/apps_state.json && chmod 644 /etc/kiosk-menu/apps_state.json
 chown kiosk:kiosk /etc/kiosk-menu 2>/dev/null || true
+mkdir -p /var/log/kiosk-menu && chown kiosk:kiosk /var/log/kiosk-menu
 
 # ClamAV – bases officielles + signatures tierces
 mkdir -p /var/lib/clamav /var/log/clamav /var/run/clamav
@@ -1092,7 +1313,7 @@ cp "$SCRIPT_DIR/menu_selector/main.py" config/includes.chroot/opt/kiosk-menu/mai
 ok "Menu copié"
 
 # =============================================================================
-# Menus de boot (syslinux BIOS + GRUB UEFI) – 2 entrées
+# Menus de boot (syslinux BIOS + GRUB UEFI) – 3 entrées
 # =============================================================================
 step "Création des menus de boot (syslinux + GRUB EFI)..."
 mkdir -p config/includes.binary/isolinux
@@ -1109,6 +1330,11 @@ LABEL live
   MENU DEFAULT
   KERNEL /live/vmlinuz
   APPEND initrd=/live/initrd.img ${BOOT_PARAMS}
+
+LABEL install
+  MENU LABEL > Installer sur le disque (kiosque persistant)
+  KERNEL /live/vmlinuz
+  APPEND initrd=/live/initrd.img ${BOOT_PARAMS} installer=1
 
 LABEL live-safe
   MENU LABEL > Demarrer - Sans echec (nomodeset)
@@ -1128,6 +1354,11 @@ fi
 
 menuentry "Demarrer (menu de selection)" {
   linux /live/vmlinuz ${BOOT_PARAMS}
+  initrd /live/initrd.img
+}
+
+menuentry "Installer sur le disque (kiosque persistant)" {
+  linux /live/vmlinuz ${BOOT_PARAMS} installer=1
   initrd /live/initrd.img
 }
 
@@ -1167,6 +1398,11 @@ LABEL live
   KERNEL /live/vmlinuz
   APPEND initrd=/live/initrd.img \${BOOT_PARAMS}
 
+LABEL install
+  MENU LABEL > Installer sur le disque (kiosque persistant)
+  KERNEL /live/vmlinuz
+  APPEND initrd=/live/initrd.img \${BOOT_PARAMS} installer=1
+
 LABEL live-safe
   MENU LABEL > Demarrer - Sans echec (nomodeset)
   KERNEL /live/vmlinuz
@@ -1193,6 +1429,11 @@ fi
 
 menuentry "Demarrer (menu de selection)" {
   linux /live/vmlinuz \${BOOT_PARAMS}
+  initrd /live/initrd.img
+}
+
+menuentry "Installer sur le disque (kiosque persistant)" {
+  linux /live/vmlinuz \${BOOT_PARAMS} installer=1
   initrd /live/initrd.img
 }
 
@@ -1250,7 +1491,8 @@ echo "║    -> fichier : /etc/kiosk-menu/admin.pass"
 echo "╠══════════════════════════════════════════════════════════════╣"
 echo "║  MENU DE DÉMARRAGE (BIOS syslinux + UEFI GRUB) :             ║"
 echo "║    1. Demarrer (menu de selection)                          ║"
-echo "║    2. Demarrer - Sans echec (nomodeset)                     ║"
+echo "║    2. Installer sur le disque (kiosque persistant)          ║"
+echo "║    3. Demarrer - Sans echec (nomodeset)                     ║"
 echo "╠══════════════════════════════════════════════════════════════╣"
 echo "║  APPLICATIONS DISPONIBLES DANS LE MENU :                     ║"
 echo "║    - Cloneur de disque       (shadowClone)                  ║"
