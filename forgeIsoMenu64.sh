@@ -1309,7 +1309,7 @@ done
 
 step "Copie du menu de sélection..."
 mkdir -p config/includes.chroot/opt/kiosk-menu
-cp "$SCRIPT_DIR/menu_selector/main.py" config/includes.chroot/opt/kiosk-menu/main.py
+cp "$SCRIPT_DIR/menu_selector/"* config/includes.chroot/opt/kiosk-menu/
 ok "Menu copié"
 
 # =============================================================================
