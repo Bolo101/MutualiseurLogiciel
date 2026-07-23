@@ -729,8 +729,14 @@ mkdir -p /mnt/avscan_usb && chmod 777 /mnt/avscan_usb
 mkdir -p /etc/virusscanner && chmod 700 /etc/virusscanner
 mkdir -p /var/lib/yara-rules/signature-base /var/lib/yara-rules/custom
 chmod -R 755 /var/lib/yara-rules
-mkdir -p /opt/pdf && chmod 775 /opt/pdf && chown kiosk:kiosk /opt/pdf 2>/dev/null || true
-mkdir -p /opt/img && chmod 755 /opt/img
+# /opt/apps/pdf et /opt/apps/img : pdf_viewer.py et gui.py (Bastion-Antiviral)
+# résolvent ces dossiers en "../pdf" et "../img", relatifs à leur propre
+# répertoire (/opt/apps/bastion-antiviral/). Cela pointe donc vers
+# /opt/apps/pdf et /opt/apps/img — PAS /opt/pdf ni /opt/img. Le contenu réel
+# de ces dossiers (racine du dépôt, sibling de code/) est copié plus bas,
+# juste après la copie du code des 4 applications.
+mkdir -p /opt/apps/pdf && chmod 775 /opt/apps/pdf && chown kiosk:kiosk /opt/apps/pdf 2>/dev/null || true
+mkdir -p /opt/apps/img && chmod 755 /opt/apps/img
 
 # ── Mot de passe admin du menu (panneau Administration) ─────────────────────
 # Valeur par défaut à CHANGER IMPÉRATIVEMENT après le premier déploiement.
@@ -1306,6 +1312,37 @@ for app in shadowclone e-broyeur virtupack bastion-antiviral; do
     cp -r "$src"/*.py "$dest/" 2>/dev/null || true
     ok "  $app : copié depuis ${REPO_CODE_SUBDIR[$app]}/ ($(find "$dest" -name '*.py' | wc -l) fichier(s))"
 done
+
+# ── Bastion-Antiviral : contenu des dossiers pdf/ et img/ (racine du dépôt) ──
+# pdf_viewer.py résout son dossier PDF en "../pdf" relatif à son propre
+# fichier (/opt/apps/bastion-antiviral/../pdf = /opt/apps/pdf) : il faut donc
+# copier ici le contenu réel de pdf/ (et img/, sibling du même niveau),
+# sans quoi seul le dossier vide créé par le hook 0300 se retrouve sur l'ISO.
+PDF_SRC="$REPOS_DIR/bastion-antiviral/pdf"
+PDF_DEST="config/includes.chroot/opt/apps/pdf"
+mkdir -p "$PDF_DEST"
+if [[ -d "$PDF_SRC" ]]; then
+    PDF_COUNT=$(find "$PDF_SRC" -maxdepth 1 -name "*.pdf" | wc -l)
+    if [[ "$PDF_COUNT" -gt 0 ]]; then
+        cp "$PDF_SRC"/*.pdf "$PDF_DEST/"
+        ok "  bastion-antiviral : $PDF_COUNT PDF(s) copié(s) depuis pdf/ → /opt/apps/pdf"
+    else
+        warn "  bastion-antiviral : dossier pdf/ trouvé mais vide — /opt/apps/pdf sera vide au démarrage"
+    fi
+else
+    warn "  bastion-antiviral : dossier pdf/ introuvable dans le dépôt ($PDF_SRC) — /opt/apps/pdf sera vide"
+fi
+
+IMG_SRC="$REPOS_DIR/bastion-antiviral/img"
+IMG_DEST="config/includes.chroot/opt/apps/img"
+mkdir -p "$IMG_DEST"
+if [[ -d "$IMG_SRC" ]]; then
+    IMG_COUNT=$(find "$IMG_SRC" -maxdepth 1 -type f | wc -l)
+    if [[ "$IMG_COUNT" -gt 0 ]]; then
+        cp "$IMG_SRC"/* "$IMG_DEST/"
+        ok "  bastion-antiviral : $IMG_COUNT fichier(s) copié(s) depuis img/ → /opt/apps/img"
+    fi
+fi
 
 step "Copie du menu de sélection..."
 mkdir -p config/includes.chroot/opt/kiosk-menu
