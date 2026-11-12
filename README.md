@@ -25,6 +25,10 @@ Au démarrage, la borne lance un menu plein écran avec 4 boutons. Cliquer sur
 un bouton lance l'application correspondante en sous-processus ; à sa
 fermeture, le menu réapparaît automatiquement.
 
+<div style="display: flex; align-items: center;">
+  <img src="./img/gui.png" alt="GUI" width="600" style="margin-right: 20px;">
+</div>
+
 ### Panneau d'administration
 
 Un bouton **Administration** (protégé par mot de passe, fichier
