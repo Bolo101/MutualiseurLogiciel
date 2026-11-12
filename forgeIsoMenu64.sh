@@ -164,7 +164,12 @@ lb config \
     --bootappend-live "${BOOT_PARAMS}" \
     --bootloaders "syslinux,grub-efi" \
     --binary-images iso-hybrid \
-    --apt-options "--yes --no-install-recommends"
+    --apt-options "--yes"
+# NOTE : --no-install-recommends a été retiré (comme dans forgeIso64.sh). Il coupait
+# des paquets « recommends » de xorg/openbox/lightdm nécessaires à une session
+# graphique fonctionnelle (x11-xserver-utils, dbus-x11, polkitd, polices, Mesa...) :
+# X démarrait, la session ne s'établissait pas et LightDM retombait sur l'écran
+# de connexion au lieu de l'autologin.
 ok "live-build configuré"
 
 # ── Dépôts Debian ─────────────────────────────────────────────────────────────
@@ -214,6 +219,11 @@ xserver-xorg-video-nouveau
 xserver-xorg-video-vesa
 xserver-xorg-video-fbdev
 xserver-xorg-input-all
+x11-xserver-utils
+dbus
+dbus-x11
+polkitd
+pkexec
 openbox
 lightdm
 xfwm4
@@ -729,10 +739,18 @@ update-locale LANG=fr_FR.UTF-8 LC_ALL=fr_FR.UTF-8
 # ── Utilisateur kiosque (autologin, sudo sans mot de passe) ─────────────────
 # NOPASSWD est nécessaire : les 4 applications exigent root (os.geteuid()==0)
 # et sont lancées via `sudo -E python3 ...` par leurs wrappers respectifs.
+# Idempotent : groupe et utilisateur gérés séparément (un chroot réutilisé peut
+# déjà contenir le groupe sans l'utilisateur, ce qui fait échouer useradd).
+groupadd -f kiosk
 if ! id kiosk &>/dev/null; then
-    useradd -m -s /bin/bash -G sudo,plugdev,cdrom,dialout,libvirt,kvm kiosk
+    useradd -m -s /bin/bash -g kiosk kiosk
     echo "kiosk:kiosk" | chpasswd
+else
+    usermod --shell /bin/bash --gid kiosk kiosk
 fi
+for _g in sudo plugdev cdrom dialout libvirt kvm; do
+    getent group "$_g" >/dev/null && usermod --append --groups "$_g" kiosk || true
+done
 echo "kiosk ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/kiosk
 chmod 0440 /etc/sudoers.d/kiosk
 
@@ -852,7 +870,10 @@ mkdir -p /etc/X11/xorg.conf.d
 cat > /etc/X11/xorg.conf.d/99-kiosk-lock.conf << 'XORGCONF'
 Section "ServerFlags"
     Option "DontZap"       "true"
-    Option "DontVTSwitch"  "true"
+    # DontVTSwitch désactivé volontairement (comme dans forgeIso64.sh) : bloquer
+    # le changement de console (Ctrl+Alt+F2) empêche tout diagnostic en cas de
+    # plantage de la session.
+    Option "DontVTSwitch"  "false"
     Option "BlankTime"     "0"
     Option "StandbyTime"   "0"
     Option "SuspendTime"   "0"
@@ -881,63 +902,133 @@ EOF
 # sélection en boucle (relance uniquement en cas de crash).
 cat > /usr/local/bin/kiosk-menu-session.sh << 'SESSION'
 #!/bin/bash
+# Dispatcher live / installateur (aligné sur usb-antivirus-session.sh de Bastion)
 export DISPLAY=:0
+USER_NAME="$(id -un)"
 export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+export XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"
+install -d -m 0700 "$XDG_RUNTIME_DIR" 2>/dev/null || true
+chown "$USER_NAME:$USER_NAME" "$XDG_RUNTIME_DIR" 2>/dev/null || true
 
 xset s off -dpms 2>/dev/null || true
 xset s noblank   2>/dev/null || true
-
-openbox &
-OB_PID=$!
-sleep 1
-
 xsetroot -solid black 2>/dev/null || true
 
 if grep -q "installer=1" /proc/cmdline 2>/dev/null; then
     # ── Mode installateur ────────────────────────────────────────────────────
-    xterm -title "Borne Multiservices - Installation" \
+    exec xterm -title "Borne Multiservices - Installation" \
           -fa "Monospace" -fs 12 \
           -bg "#0d0d1a" -fg "#e0e0e0" \
           -e "sudo /usr/local/bin/install-to-disk.sh"
-else
-    # ── Mode live kiosque ────────────────────────────────────────────────────
+fi
+
+# ── Mode live kiosque ────────────────────────────────────────────────────────
+LOG_DIR="/var/log/kiosk-menu"
+if ! mkdir -p "$LOG_DIR" 2>/dev/null || [[ ! -w "$LOG_DIR" ]]; then
+    LOG_DIR="/tmp/kiosk-menu"
+    mkdir -p "$LOG_DIR" 2>/dev/null || true
+fi
+LOG_FILE="$LOG_DIR/session.log"
+
+# Toute la session (WM + menu) sous un vrai bus D-Bus de session.
+exec dbus-run-session -- bash -c '
+    openbox --replace >/tmp/openbox-kiosk.log 2>&1 &
+    OB_PID=$!
+    sleep 1
+    xsetroot -solid black 2>/dev/null || true
+
+    CRASH_COUNT=0
     while true; do
-        /usr/local/bin/kiosk-menu
-        [[ $? -eq 0 ]] && break
+        START_TS=$(date +%s)
+        /usr/local/bin/kiosk-menu >>"'"$LOG_FILE"'" 2>&1
+        RC=$?
+        END_TS=$(date +%s)
+        [[ $RC -eq 0 ]] && break
+
+        if (( END_TS - START_TS < 5 )); then
+            CRASH_COUNT=$((CRASH_COUNT + 1))
+        else
+            CRASH_COUNT=0
+        fi
+
+        if (( CRASH_COUNT >= 3 )); then
+            xterm -title "Borne Multiservices - ERREUR AU DEMARRAGE" \
+                  -fa "Monospace" -fs 12 \
+                  -bg "#3a0d0d" -fg "#f0f0f0" \
+                  -e "echo Menu arrêté avec le code $RC (x$CRASH_COUNT); \
+                      echo; echo Dernières lignes du log :; echo; \
+                      tail -n 60 '"$LOG_FILE"'; echo; \
+                      read -r -p \"Entrée pour réessayer...\"" || true
+            CRASH_COUNT=0
+        fi
         sleep 1
     done
 
     kill "$OB_PID" 2>/dev/null || true
     exec xfce4-session
-fi
-
-kill "$OB_PID" 2>/dev/null || true
+'
 SESSION
 chmod 755 /usr/local/bin/kiosk-menu-session.sh
 
 # ── Session pour le système INSTALLÉ (xfwm4, plus robuste en pérenne) ──────
 cat > /usr/local/bin/kiosk-menu-session-installed.sh << 'SESSION'
 #!/bin/bash
+# Session kiosque du système installé (xfwm4, aligné sur Bastion)
 export DISPLAY=:0
+USER_NAME="$(id -un)"
 export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+export XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"
+install -d -m 0700 "$XDG_RUNTIME_DIR" 2>/dev/null || true
+chown "$USER_NAME:$USER_NAME" "$XDG_RUNTIME_DIR" 2>/dev/null || true
 
 xset s off -dpms 2>/dev/null || true
 xset s noblank   2>/dev/null || true
-
 xsetroot -solid black 2>/dev/null || true
 
-xfwm4 --compositor=off &
-WM_PID=$!
-sleep 1
+LOG_DIR="/var/log/kiosk-menu"
+if ! mkdir -p "$LOG_DIR" 2>/dev/null || [[ ! -w "$LOG_DIR" ]]; then
+    LOG_DIR="/tmp/kiosk-menu"
+    mkdir -p "$LOG_DIR" 2>/dev/null || true
+fi
+LOG_FILE="$LOG_DIR/session.log"
 
-while true; do
-    /usr/local/bin/kiosk-menu
-    [[ $? -eq 0 ]] && break
+# Toute la session (WM + menu) sous un vrai bus D-Bus de session.
+exec dbus-run-session -- bash -c '
+    xfwm4 --compositor=off >/tmp/xfwm4-kiosk.log 2>&1 &
+    OB_PID=$!
     sleep 1
-done
+    xsetroot -solid black 2>/dev/null || true
 
-kill "$WM_PID" 2>/dev/null || true
-exec xfce4-session
+    CRASH_COUNT=0
+    while true; do
+        START_TS=$(date +%s)
+        /usr/local/bin/kiosk-menu >>"'"$LOG_FILE"'" 2>&1
+        RC=$?
+        END_TS=$(date +%s)
+        [[ $RC -eq 0 ]] && break
+
+        if (( END_TS - START_TS < 5 )); then
+            CRASH_COUNT=$((CRASH_COUNT + 1))
+        else
+            CRASH_COUNT=0
+        fi
+
+        if (( CRASH_COUNT >= 3 )); then
+            xterm -title "Borne Multiservices - ERREUR AU DEMARRAGE" \
+                  -fa "Monospace" -fs 12 \
+                  -bg "#3a0d0d" -fg "#f0f0f0" \
+                  -e "echo Menu arrêté avec le code $RC (x$CRASH_COUNT); \
+                      echo; echo Dernières lignes du log :; echo; \
+                      tail -n 60 '"$LOG_FILE"'; echo; \
+                      read -r -p \"Entrée pour réessayer...\"" || true
+            CRASH_COUNT=0
+        fi
+        sleep 1
+    done
+
+    kill "$OB_PID" 2>/dev/null || true
+    exec xfce4-session
+'
 SESSION
 chmod 755 /usr/local/bin/kiosk-menu-session-installed.sh
 
@@ -1378,6 +1469,33 @@ if [[ -n "${ABUSECH_AUTH_KEY:-}" ]]; then
 else
     warn "URLhaus ignoré : abuse.ch exige une clé depuis le 21/10/2026 (sudo env ABUSECH_AUTH_KEY=… ./forgeIsoMenu64.sh)"
 fi
+
+# =============================================================================
+# LightDM autologin + règle polkit : aussi via includes.chroot (comme Bastion)
+# =============================================================================
+mkdir -p config/includes.chroot/etc/lightdm/lightdm.conf.d
+cat > config/includes.chroot/etc/lightdm/lightdm.conf.d/50-autologin.conf << 'EOF'
+[Seat:*]
+autologin-user=kiosk
+autologin-session=kiosk-menu
+autologin-user-timeout=0
+allow-guest=false
+EOF
+mkdir -p config/includes.chroot/etc/skel
+cat > config/includes.chroot/etc/skel/.dmrc << 'EOF'
+[Desktop]
+Session=kiosk-menu
+EOF
+mkdir -p config/includes.chroot/etc/polkit-1/rules.d
+cat > config/includes.chroot/etc/polkit-1/rules.d/49-kiosk-sudo.rules << 'EOF'
+polkit.addRule(function(action, subject) {
+    if (action.id.indexOf("org.freedesktop.policykit") === 0 &&
+        subject.isInGroup("sudo")) {
+        return polkit.Result.YES;
+    }
+});
+EOF
+ok "Autologin LightDM + règle polkit → includes.chroot"
 
 # =============================================================================
 # Copie du code des 4 applications + du menu de sélection
