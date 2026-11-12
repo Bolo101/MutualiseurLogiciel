@@ -36,7 +36,9 @@
 # ║                    détection mécanique/SSD de e-Broyeur (is_ssd() dans        ║
 # ║                    disk_erase.py) lit cet attribut directement et doit        ║
 # ║                    rester fiable pour choisir le bon algorithme d'effacement. ║
-# ║    - Bastion-Antiviral : hooks ClamAV / YARA / Avast repris tels quels.       ║
+# ║    - Bastion-Antiviral : hooks ClamAV / YARA / Avast alignés sur forgeIso64.sh ║
+# ║                    (Sanesecurity en HTTPS, InterServer, URLhaus avec clé       ║
+# ║                    abuse.ch, chkrootkit installé mais jamais lancé auto).      ║
 # ║    - shadowClone : son code vit dans code_installer/ dans le dépôt amont      ║
 # ║                    (pas code/) — c'est le seul des 4 dans ce cas.             ║
 # ║                                                                                ║
@@ -55,6 +57,10 @@
 # ║                                                                                ║
 # ║  Exécution :                                                                  ║
 # ║    chmod +x forgeIsoMenu64.sh && sudo ./forgeIsoMenu64.sh                    ║
+# ║                                                                                ║
+# ║  Option : clé abuse.ch pour la signature ClamAV URLhaus (sinon ignorée) :     ║
+# ║    sudo env ABUSECH_AUTH_KEY=VOTRE_CLE ./forgeIsoMenu64.sh                    ║
+# ║    (depuis le 21/10/2026 le téléchargement sans clé répond 410 Gone)          ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 set -euo pipefail
@@ -262,6 +268,8 @@ python3-yara
 clamav
 clamav-daemon
 clamav-freshclam
+# Détection de rootkits sur le système hôte (lancement manuel : sudo chkrootkit)
+chkrootkit
 # avast ← ajouté dynamiquement par le hook 0250 (dépôt tiers, non listé ici)
 EOF
 ok "Liste de paquets définie"
@@ -344,7 +352,21 @@ ok "Hook ClamAV créé"
 step "Création du hook signatures tierces ClamAV..."
 cat > config/hooks/normal/0150-clamav-thirdparty.hook.chroot << 'HOOK'
 #!/bin/bash
-set -uo pipefail
+# =============================================================================
+# Hook 0150 – Téléchargement des signatures tierces ClamAV
+#
+# Stratégie de validation : chaque fichier est validé immédiatement après
+# son installation dans DB_DIR en testant le RÉPERTOIRE COMPLET avec clamscan.
+# Si l'ajout du fichier casse le chargement, il est supprimé avant de passer
+# au suivant. Cela élimine les conflits dès leur apparition sans algorithme
+# d'isolation post-hoc.
+#
+# Sources :
+#   Sanesecurity  – phishing, malwares, spam (màj horaire)
+#   InterServer   – signatures généralistes
+#   URLhaus       – URLs malveillantes actives (abuse.ch)
+# =============================================================================
+set -uo pipefail   # pas de -e : on ne bloque pas le build sur un wget raté
 
 DB_DIR="/var/lib/clamav"
 LOG="/var/log/clamav-thirdparty.log"
@@ -355,11 +377,17 @@ TP_SKIP=0
 
 echo ">>> [Hook TP] Début des signatures tierces ClamAV…" | tee "$LOG"
 
+# ── Détection clamscan ────────────────────────────────────────────────────────
 if ! command -v clamscan &>/dev/null; then
     echo ">>> [Hook TP] clamscan introuvable — validation impossible, skip." | tee -a "$LOG"
     exit 0
 fi
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+# Vérifie qu'un fichier est une signature ClamAV valide et non une page HTML.
+# Tous les formats tiers (.ndb .hdb .hsb .ldb .cdb .db .ftm .fp .ign2) sont du
+# texte brut : leur première ligne ne commence jamais par '<' ou 'HTTP'.
 _is_valid_content() {
     local FILE="$1"
     local HEADER
@@ -371,11 +399,15 @@ _is_valid_content() {
     return 0
 }
 
+# _db_ok : teste que le RÉPERTOIRE COMPLET se charge sans erreur (timeout 60s).
+# Utilise /dev/null comme cible de scan fictive — code 0 ou 1 = base OK.
 _db_ok() {
     local OUT
     OUT=$(timeout 60 clamscan --no-summary --database="$DB_DIR" /dev/null 2>&1)
     local RC=$?
+    # rc=0 propre, rc=1 détection (normal sur /dev/null parfois), rc=2 erreur base
     if [[ $RC -eq 2 ]]; then
+        # Cherche des erreurs réelles de chargement de base dans la sortie
         if echo "$OUT" | grep -qiE "error loading|can't load|invalid|corrupt|can't open"; then
             return 1
         fi
@@ -383,6 +415,9 @@ _db_ok() {
     return 0
 }
 
+# install_and_validate <url> <fname> <min_bytes>
+# Télécharge, vérifie le contenu, installe dans DB_DIR, valide la base complète.
+# Supprime le fichier si la validation échoue. Retourne 0 si installé, 1 sinon.
 install_and_validate() {
     local URL="$1" FNAME="$2" MIN_SIZE="${3:-64}"
     local DEST="$DB_DIR/$FNAME"
@@ -409,10 +444,12 @@ install_and_validate() {
         rm -f "$TMP"; return 1
     fi
 
+    # Installer dans DB_DIR
     mv "$TMP" "$DEST"
     chmod 644 "$DEST"
     chown clamav:clamav "$DEST" 2>/dev/null || true
 
+    # Valider la base COMPLÈTE avec ce fichier en place
     if _db_ok; then
         echo "  ✅ $FNAME installé et validé (${SIZE} o)" | tee -a "$LOG"
         TP_OK=$((TP_OK + 1))
@@ -425,6 +462,10 @@ install_and_validate() {
     fi
 }
 
+# ── Sanesecurity ──────────────────────────────────────────────────────────────
+# Liste des signatures validées depuis https://sanesecurity.com/usage/signatures/
+# Chaque fichier est téléchargé et validé individuellement — les conflits sont
+# éliminés au fur et à mesure sans purge globale.
 echo ">>> [Hook TP] Sanesecurity…" | tee -a "$LOG"
 
 SANE_FILES=(
@@ -453,40 +494,9 @@ SANE_FILES=(
 
 SANE_BASE_URL=""
 
-if command -v rsync &>/dev/null; then
-    echo "  rsync://rsync.sanesecurity.net/sanesecurity …" | tee -a "$LOG"
-    RSYNC_TMP="$(mktemp -d /tmp/sanesec_rsync_XXXXXX)"
-    if rsync --timeout=30 --contimeout=15 --no-recursive -q \
-        rsync://rsync.sanesecurity.net/sanesecurity/ "$RSYNC_TMP/" 2>>"$LOG" \
-       && [[ $(ls "$RSYNC_TMP" 2>/dev/null | wc -l) -gt 0 ]]; then
-        echo "  rsync OK — validation individuelle de chaque fichier…" | tee -a "$LOG"
-        for fname in "${SANE_FILES[@]}"; do
-            if [[ -f "$RSYNC_TMP/$fname" ]]; then
-                SZ=$(stat -c%s "$RSYNC_TMP/$fname" 2>/dev/null || echo 0)
-                if [[ "$SZ" -ge 64 ]] && _is_valid_content "$RSYNC_TMP/$fname"; then
-                    DEST="$DB_DIR/$fname"
-                    cp "$RSYNC_TMP/$fname" "$DEST"
-                    chmod 644 "$DEST"; chown clamav:clamav "$DEST" 2>/dev/null || true
-                    if _db_ok; then
-                        echo "  ✅ $fname (rsync, ${SZ}o)" | tee -a "$LOG"
-                        TP_OK=$((TP_OK + 1))
-                    else
-                        echo "  ⚠ $fname incompatible — supprimé" | tee -a "$LOG"
-                        rm -f "$DEST"
-                        TP_SKIP=$((TP_SKIP + 1))
-                    fi
-                fi
-            fi
-        done
-        SANE_BASE_URL="rsync"
-    else
-        echo "  ⚠ rsync Sanesecurity inaccessible — fallback HTTP" | tee -a "$LOG"
-    fi
-    rm -rf "$RSYNC_TMP"
-fi
-
+# Récupération via HTTP(S) uniquement
 if [[ -z "$SANE_BASE_URL" ]]; then
-    echo "  Fallback HTTP Sanesecurity…" | tee -a "$LOG"
+    echo "  Sanesecurity via HTTP(S)…" | tee -a "$LOG"
     for SANE_HTTP in \
         "https://mirror.ihost.md/clamav/sanesecurity" \
         "https://ftp.swin.edu.au/sanesecurity"; do
@@ -503,21 +513,29 @@ fi
 
 [[ -n "$SANE_BASE_URL" ]] || echo "  ⚠ Sanesecurity inaccessible — ignoré." | tee -a "$LOG"
 
+# ── InterServer ───────────────────────────────────────────────────────────────
 echo ">>> [Hook TP] InterServer…" | tee -a "$LOG"
-install_and_validate "http://sigs.interserver.net/interserver256.hdb" "interserver256.hdb" 500 || true
-install_and_validate "http://sigs.interserver.net/topline.db"          "topline.db"          500 || true
+install_and_validate "https://sigs.interserver.net/interserver256.hdb" "interserver256.hdb" 500 || true
+install_and_validate "https://sigs.interserver.net/interservertopline.db" "interservertopline.db" 500 || true
 
+# ── URLhaus (abuse.ch) ────────────────────────────────────────────────────────
+# Depuis le 21/10/2026 abuse.ch exige une clé d'authentification pour l'export
+# ClamAV (l'ancienne URL répond 410, le miroir malware-filter 404). La clé n'est
+# JAMAIS écrite dans ce hook : le fichier est pré-téléchargé sur la machine de
+# build quand ABUSECH_AUTH_KEY y est défini ; il est alors déjà dans $DB_DIR.
 echo ">>> [Hook TP] URLhaus…" | tee -a "$LOG"
-URLHAUS_OK=false
-for _url in \
-    "https://urlhaus.abuse.ch/downloads/urlhaus.ndb" \
-    "https://curbengh.github.io/malware-filter/urlhaus-filter-clam.ndb"; do
-    if install_and_validate "$_url" "urlhaus-filter.ndb" 1000; then
-        URLHAUS_OK=true; break
+if [[ -f "$DB_DIR/urlhaus-filter.ndb" ]]; then
+    if _db_ok; then
+        echo "  ✅ urlhaus-filter.ndb présent (pré-téléchargé avec la clé abuse.ch)" | tee -a "$LOG"
+    else
+        echo "  ⚠ urlhaus-filter.ndb incompatible avec la base — supprimé" | tee -a "$LOG"
+        rm -f "$DB_DIR/urlhaus-filter.ndb"
     fi
-done
-$URLHAUS_OK || echo "  ⚠ URLhaus inaccessible — ignoré." | tee -a "$LOG"
+else
+    echo "  ↷ URLhaus ignoré (clé abuse.ch requise — voir ABUSECH_AUTH_KEY)" | tee -a "$LOG"
+fi
 
+# ── Bilan final ───────────────────────────────────────────────────────────────
 TP_FINAL=$(find "$DB_DIR" \( \
     -name "*.ndb" -o -name "*.hdb" -o -name "*.hsb" \
     -o -name "*.db"  -o -name "*.ftm" -o -name "*.ldb" \
@@ -526,6 +544,7 @@ TP_FINAL=$(find "$DB_DIR" \( \
 
 echo ">>> [Hook TP] ✅ Terminé : $TP_OK installés, $TP_SKIP rejetés, $TP_FINAL fichier(s) tiers actifs." | tee -a "$LOG"
 
+# Vérification finale de cohérence
 if ! _db_ok; then
     echo ">>> [Hook TP] ❌ La base ne se charge toujours pas — purge totale des fichiers tiers." | tee -a "$LOG"
     find "$DB_DIR" \( -name "*.ndb" -o -name "*.hdb" -o -name "*.hsb" \
@@ -1136,6 +1155,15 @@ directement sur le menu de sélection installé sur $TARGET." \
 INSTALLER
 chmod 755 /usr/local/bin/install-to-disk.sh
 
+# chkrootkit : disponible en ligne de commande (sudo chkrootkit), mais jamais
+# lancé automatiquement (le paquet fournit un cron/timer quotidien).
+for _u in $(ls /usr/lib/systemd/system /lib/systemd/system 2>/dev/null \
+            | grep -E '^chkrootkit.*\.(timer|service)$' | sort -u); do
+    systemctl disable "$_u" 2>/dev/null || true
+done
+[ -f /etc/chkrootkit/chkrootkit.conf ] && \
+    sed -i 's/^RUN_DAILY=.*/RUN_DAILY="false"/' /etc/chkrootkit/chkrootkit.conf || true
+
 echo ">>> [Hook Système] OK ✅"
 HOOK
 chmod +x config/hooks/normal/0300-system-config.hook.chroot
@@ -1296,10 +1324,60 @@ fi
 
 chown -R kiosk:kiosk /home/kiosk/ 2>/dev/null || true
 
+command -v chkrootkit >/dev/null 2>&1 \
+    || echo ">>> [Hook Permissions] ⚠ chkrootkit absent de l'image" >&2
+
 echo ">>> [Hook Permissions] OK ✅"
 HOOK
 chmod +x config/hooks/normal/0400-permissions.hook.chroot
 ok "Hook permissions créé"
+
+# =============================================================================
+# URLhaus (abuse.ch) : pré-téléchargement sur la machine de build
+# =============================================================================
+# Depuis le 21/10/2026 abuse.ch n'offre plus de téléchargement sans clé (410 Gone) ;
+# l'export ClamAV exige une clé d'authentification (« Auth-Key », gratuite, inscription
+# sur auth.abuse.ch — vérifier les conditions d'abuse.ch pour votre usage). Sans clé,
+# URLhaus est simplement ignoré. La clé n'est JAMAIS écrite dans un hook : le fichier
+# est déposé ici dans le chroot, et le hook 0150 le valide pendant lb build.
+# La clé passe par stdin (curl -K -) : elle n'apparaît ni dans la liste des
+# processus, ni dans les messages, ni dans les journaux.
+step "URLhaus (abuse.ch) : pré-téléchargement sur la machine de build..."
+CLAMAV_CHROOT="config/includes.chroot/var/lib/clamav"
+mkdir -p "$CLAMAV_CHROOT"
+
+_is_valid_clamav_file() {
+    local FILE="$1"
+    local HEADER
+    HEADER=$(head -c 64 "$FILE" 2>/dev/null)
+    case "$HEADER" in
+        '<'*|'HTTP/'*|'{"'*|'<!DOCTYPE'*|'<!doctype'*) return 1 ;;
+    esac
+    [[ -n "$HEADER" ]] || return 1
+    return 0
+}
+
+if [[ -n "${ABUSECH_AUTH_KEY:-}" ]]; then
+    if [[ ! "$ABUSECH_AUTH_KEY" =~ ^[A-Za-z0-9._~-]+$ ]]; then
+        warn "ABUSECH_AUTH_KEY invalide (lettres, chiffres, . _ ~ - uniquement) — URLhaus ignoré"
+    else
+        _UH_TMP="$(mktemp /tmp/urlhaus_XXXXXX)"
+        if printf 'url = "%s"\n' \
+               "https://urlhaus-api.abuse.ch/v2/files/exports/${ABUSECH_AUTH_KEY}/urlhaus_clamav.ndb" \
+           | curl -fsSL --connect-timeout 15 --max-time 120 -K - -o "$_UH_TMP" 2>/dev/null \
+           && [[ "$(stat -c%s "$_UH_TMP" 2>/dev/null || echo 0)" -ge 1000 ]] \
+           && _is_valid_clamav_file "$_UH_TMP"; then
+            mv "$_UH_TMP" "$CLAMAV_CHROOT/urlhaus-filter.ndb"
+            chmod 644 "$CLAMAV_CHROOT/urlhaus-filter.ndb"
+            ok "urlhaus-filter.ndb inclus ($(du -h "$CLAMAV_CHROOT/urlhaus-filter.ndb" | cut -f1)) — clé abuse.ch"
+        else
+            rm -f "$_UH_TMP"
+            warn "URLhaus : téléchargement refusé (clé invalide, expirée ou service indisponible) — ignoré"
+        fi
+    fi
+else
+    warn "URLhaus ignoré : abuse.ch exige une clé depuis le 21/10/2026 (sudo env ABUSECH_AUTH_KEY=… ./forgeIsoMenu64.sh)"
+fi
 
 # =============================================================================
 # Copie du code des 4 applications + du menu de sélection
