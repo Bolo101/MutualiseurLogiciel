@@ -340,9 +340,6 @@ def load_apps_state() -> dict[str, bool]:
     return state
 
 
-
-
-
 # ═════════════════════════════════════════════════════════════════════════════
 # Fenêtre principale
 # ═════════════════════════════════════════════════════════════════════════════
@@ -367,8 +364,38 @@ class KioskMenu:
         for widget in self.root.winfo_children():
             widget.destroy()
 
-        # Bande de couleur en haut : unifie visuellement les 4 services,
-        # apporte de la couleur dès le premier regard sur l'écran.
+        # ── Pied de page EN PREMIER (toujours visible, même en basse résolution) ──
+        footer = tk.Frame(self.root, bg=BG_COLOR)
+        footer.pack(side="bottom", fill="x", pady=(0, 16))
+
+        tk.Frame(footer, bg="#21262d", height=1).pack(fill="x", padx=50, pady=(0, 10))
+
+        bottom_row = tk.Frame(footer, bg=BG_COLOR)
+        bottom_row.pack(fill="x", padx=50)
+
+        tk.Label(
+            bottom_row, text="Borne Multiservices", font=("DejaVu Sans", 10),
+            bg=BG_COLOR, fg="#484f58",
+        ).pack(side="left")
+
+        admin_btn = tk.Button(
+            bottom_row,
+            text="⚙  Administration",
+            font=("DejaVu Sans", 12),
+            command=lambda: open_admin_panel(self.root, self.refresh_tiles),
+            bg="#161b22",
+            fg=MUTED_FG,
+            activebackground="#21262d",
+            activeforeground=HEADER_FG,
+            relief="flat",
+            padx=15,
+            pady=8,
+            bd=0,
+            cursor="hand2",
+        )
+        admin_btn.pack(side="right")
+
+        # ── Bande de couleur en haut ──
         stripe = tk.Canvas(self.root, height=8, bg=BG_COLOR, highlightthickness=0)
         stripe.pack(fill="x", side="top")
         self.root.update_idletasks()
@@ -384,8 +411,7 @@ class KioskMenu:
         stripe.bind("<Configure>", draw_stripe)
         draw_stripe()
 
-        # En-tête : présentation de la borne + horloge (garde le repère "l'écran
-        # est vivant") à la place d'une salutation personnelle.
+        # ── En-tête ──
         header = tk.Frame(self.root, bg=BG_COLOR)
         header.pack(fill="x", pady=(24, 6))
 
@@ -418,7 +444,7 @@ class KioskMenu:
             font=("DejaVu Sans", 12, "italic"), bg=BG_COLOR, fg="#586069",
         ).pack(anchor="w", padx=50, pady=(6, 0))
 
-        # Grille des 4 services
+        # ── Grille des 4 services ──
         grid = tk.Frame(self.root, bg=BG_COLOR)
         grid.pack(expand=True, fill="both", padx=50, pady=14)
 
@@ -427,37 +453,6 @@ class KioskMenu:
             grid.rowconfigure(row, weight=1)
             grid.columnconfigure(col, weight=1)
             self.build_tile(grid, app, row, col)
-
-        # Pied de page
-        footer = tk.Frame(self.root, bg=BG_COLOR)
-        footer.pack(fill="x", pady=(0, 16))
-
-        tk.Frame(footer, bg="#21262d", height=1).pack(fill="x", padx=50, pady=(0, 10))
-
-        bottom_row = tk.Frame(footer, bg=BG_COLOR)
-        bottom_row.pack(fill="x", padx=50)
-
-        tk.Label(
-            bottom_row, text="Borne Multiservices", font=("DejaVu Sans", 10),
-            bg=BG_COLOR, fg="#484f58",
-        ).pack(side="left")
-
-        admin_btn = tk.Button(
-            bottom_row,
-            text="⚙  Administration",
-            font=("DejaVu Sans", 12),
-            command=lambda: open_admin_panel(self.root, self.refresh_tiles),
-            bg="#161b22",
-            fg=MUTED_FG,
-            activebackground="#21262d",
-            activeforeground=HEADER_FG,
-            relief="flat",
-            padx=15,
-            pady=8,
-            bd=0,
-            cursor="hand2",
-        )
-        admin_btn.pack(side="right")
 
     def build_tile(self, grid: tk.Frame, app: dict, row: int, col: int) -> None:
         enabled = self.apps_state.get(app["id"], True)

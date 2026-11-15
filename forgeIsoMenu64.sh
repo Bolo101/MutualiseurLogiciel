@@ -36,7 +36,9 @@
 # ║                    détection mécanique/SSD de e-Broyeur (is_ssd() dans        ║
 # ║                    disk_erase.py) lit cet attribut directement et doit        ║
 # ║                    rester fiable pour choisir le bon algorithme d'effacement. ║
-# ║    - Bastion-Antiviral : hooks ClamAV / YARA / Avast repris tels quels.       ║
+# ║    - Bastion-Antiviral : hooks ClamAV / YARA / Avast alignés sur forgeIso64.sh ║
+# ║                    (Sanesecurity en HTTPS, InterServer, URLhaus avec clé       ║
+# ║                    abuse.ch, chkrootkit installé mais jamais lancé auto).      ║
 # ║    - shadowClone : son code vit dans code_installer/ dans le dépôt amont      ║
 # ║                    (pas code/) — c'est le seul des 4 dans ce cas.             ║
 # ║                                                                                ║
@@ -55,6 +57,10 @@
 # ║                                                                                ║
 # ║  Exécution :                                                                  ║
 # ║    chmod +x forgeIsoMenu64.sh && sudo ./forgeIsoMenu64.sh                    ║
+# ║                                                                                ║
+# ║  Option : clé abuse.ch pour la signature ClamAV URLhaus (sinon ignorée) :     ║
+# ║    sudo env ABUSECH_AUTH_KEY=VOTRE_CLE ./forgeIsoMenu64.sh                    ║
+# ║    (depuis le 21/10/2026 le téléchargement sans clé répond 410 Gone)          ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 set -euo pipefail
@@ -158,7 +164,12 @@ lb config \
     --bootappend-live "${BOOT_PARAMS}" \
     --bootloaders "syslinux,grub-efi" \
     --binary-images iso-hybrid \
-    --apt-options "--yes --no-install-recommends"
+    --apt-options "--yes"
+# NOTE : --no-install-recommends a été retiré (comme dans forgeIso64.sh). Il coupait
+# des paquets « recommends » de xorg/openbox/lightdm nécessaires à une session
+# graphique fonctionnelle (x11-xserver-utils, dbus-x11, polkitd, polices, Mesa...) :
+# X démarrait, la session ne s'établissait pas et LightDM retombait sur l'écran
+# de connexion au lieu de l'autologin.
 ok "live-build configuré"
 
 # ── Dépôts Debian ─────────────────────────────────────────────────────────────
@@ -208,6 +219,11 @@ xserver-xorg-video-nouveau
 xserver-xorg-video-vesa
 xserver-xorg-video-fbdev
 xserver-xorg-input-all
+x11-xserver-utils
+dbus
+dbus-x11
+polkitd
+pkexec
 openbox
 lightdm
 xfwm4
@@ -262,6 +278,8 @@ python3-yara
 clamav
 clamav-daemon
 clamav-freshclam
+# Détection de rootkits sur le système hôte (lancement manuel : sudo chkrootkit)
+chkrootkit
 # avast ← ajouté dynamiquement par le hook 0250 (dépôt tiers, non listé ici)
 EOF
 ok "Liste de paquets définie"
@@ -344,7 +362,21 @@ ok "Hook ClamAV créé"
 step "Création du hook signatures tierces ClamAV..."
 cat > config/hooks/normal/0150-clamav-thirdparty.hook.chroot << 'HOOK'
 #!/bin/bash
-set -uo pipefail
+# =============================================================================
+# Hook 0150 – Téléchargement des signatures tierces ClamAV
+#
+# Stratégie de validation : chaque fichier est validé immédiatement après
+# son installation dans DB_DIR en testant le RÉPERTOIRE COMPLET avec clamscan.
+# Si l'ajout du fichier casse le chargement, il est supprimé avant de passer
+# au suivant. Cela élimine les conflits dès leur apparition sans algorithme
+# d'isolation post-hoc.
+#
+# Sources :
+#   Sanesecurity  – phishing, malwares, spam (màj horaire)
+#   InterServer   – signatures généralistes
+#   URLhaus       – URLs malveillantes actives (abuse.ch)
+# =============================================================================
+set -uo pipefail   # pas de -e : on ne bloque pas le build sur un wget raté
 
 DB_DIR="/var/lib/clamav"
 LOG="/var/log/clamav-thirdparty.log"
@@ -355,11 +387,17 @@ TP_SKIP=0
 
 echo ">>> [Hook TP] Début des signatures tierces ClamAV…" | tee "$LOG"
 
+# ── Détection clamscan ────────────────────────────────────────────────────────
 if ! command -v clamscan &>/dev/null; then
     echo ">>> [Hook TP] clamscan introuvable — validation impossible, skip." | tee -a "$LOG"
     exit 0
 fi
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+# Vérifie qu'un fichier est une signature ClamAV valide et non une page HTML.
+# Tous les formats tiers (.ndb .hdb .hsb .ldb .cdb .db .ftm .fp .ign2) sont du
+# texte brut : leur première ligne ne commence jamais par '<' ou 'HTTP'.
 _is_valid_content() {
     local FILE="$1"
     local HEADER
@@ -371,11 +409,15 @@ _is_valid_content() {
     return 0
 }
 
+# _db_ok : teste que le RÉPERTOIRE COMPLET se charge sans erreur (timeout 60s).
+# Utilise /dev/null comme cible de scan fictive — code 0 ou 1 = base OK.
 _db_ok() {
     local OUT
     OUT=$(timeout 60 clamscan --no-summary --database="$DB_DIR" /dev/null 2>&1)
     local RC=$?
+    # rc=0 propre, rc=1 détection (normal sur /dev/null parfois), rc=2 erreur base
     if [[ $RC -eq 2 ]]; then
+        # Cherche des erreurs réelles de chargement de base dans la sortie
         if echo "$OUT" | grep -qiE "error loading|can't load|invalid|corrupt|can't open"; then
             return 1
         fi
@@ -383,6 +425,9 @@ _db_ok() {
     return 0
 }
 
+# install_and_validate <url> <fname> <min_bytes>
+# Télécharge, vérifie le contenu, installe dans DB_DIR, valide la base complète.
+# Supprime le fichier si la validation échoue. Retourne 0 si installé, 1 sinon.
 install_and_validate() {
     local URL="$1" FNAME="$2" MIN_SIZE="${3:-64}"
     local DEST="$DB_DIR/$FNAME"
@@ -409,10 +454,12 @@ install_and_validate() {
         rm -f "$TMP"; return 1
     fi
 
+    # Installer dans DB_DIR
     mv "$TMP" "$DEST"
     chmod 644 "$DEST"
     chown clamav:clamav "$DEST" 2>/dev/null || true
 
+    # Valider la base COMPLÈTE avec ce fichier en place
     if _db_ok; then
         echo "  ✅ $FNAME installé et validé (${SIZE} o)" | tee -a "$LOG"
         TP_OK=$((TP_OK + 1))
@@ -425,6 +472,10 @@ install_and_validate() {
     fi
 }
 
+# ── Sanesecurity ──────────────────────────────────────────────────────────────
+# Liste des signatures validées depuis https://sanesecurity.com/usage/signatures/
+# Chaque fichier est téléchargé et validé individuellement — les conflits sont
+# éliminés au fur et à mesure sans purge globale.
 echo ">>> [Hook TP] Sanesecurity…" | tee -a "$LOG"
 
 SANE_FILES=(
@@ -453,40 +504,9 @@ SANE_FILES=(
 
 SANE_BASE_URL=""
 
-if command -v rsync &>/dev/null; then
-    echo "  rsync://rsync.sanesecurity.net/sanesecurity …" | tee -a "$LOG"
-    RSYNC_TMP="$(mktemp -d /tmp/sanesec_rsync_XXXXXX)"
-    if rsync --timeout=30 --contimeout=15 --no-recursive -q \
-        rsync://rsync.sanesecurity.net/sanesecurity/ "$RSYNC_TMP/" 2>>"$LOG" \
-       && [[ $(ls "$RSYNC_TMP" 2>/dev/null | wc -l) -gt 0 ]]; then
-        echo "  rsync OK — validation individuelle de chaque fichier…" | tee -a "$LOG"
-        for fname in "${SANE_FILES[@]}"; do
-            if [[ -f "$RSYNC_TMP/$fname" ]]; then
-                SZ=$(stat -c%s "$RSYNC_TMP/$fname" 2>/dev/null || echo 0)
-                if [[ "$SZ" -ge 64 ]] && _is_valid_content "$RSYNC_TMP/$fname"; then
-                    DEST="$DB_DIR/$fname"
-                    cp "$RSYNC_TMP/$fname" "$DEST"
-                    chmod 644 "$DEST"; chown clamav:clamav "$DEST" 2>/dev/null || true
-                    if _db_ok; then
-                        echo "  ✅ $fname (rsync, ${SZ}o)" | tee -a "$LOG"
-                        TP_OK=$((TP_OK + 1))
-                    else
-                        echo "  ⚠ $fname incompatible — supprimé" | tee -a "$LOG"
-                        rm -f "$DEST"
-                        TP_SKIP=$((TP_SKIP + 1))
-                    fi
-                fi
-            fi
-        done
-        SANE_BASE_URL="rsync"
-    else
-        echo "  ⚠ rsync Sanesecurity inaccessible — fallback HTTP" | tee -a "$LOG"
-    fi
-    rm -rf "$RSYNC_TMP"
-fi
-
+# Récupération via HTTP(S) uniquement
 if [[ -z "$SANE_BASE_URL" ]]; then
-    echo "  Fallback HTTP Sanesecurity…" | tee -a "$LOG"
+    echo "  Sanesecurity via HTTP(S)…" | tee -a "$LOG"
     for SANE_HTTP in \
         "https://mirror.ihost.md/clamav/sanesecurity" \
         "https://ftp.swin.edu.au/sanesecurity"; do
@@ -503,21 +523,29 @@ fi
 
 [[ -n "$SANE_BASE_URL" ]] || echo "  ⚠ Sanesecurity inaccessible — ignoré." | tee -a "$LOG"
 
+# ── InterServer ───────────────────────────────────────────────────────────────
 echo ">>> [Hook TP] InterServer…" | tee -a "$LOG"
-install_and_validate "http://sigs.interserver.net/interserver256.hdb" "interserver256.hdb" 500 || true
-install_and_validate "http://sigs.interserver.net/topline.db"          "topline.db"          500 || true
+install_and_validate "https://sigs.interserver.net/interserver256.hdb" "interserver256.hdb" 500 || true
+install_and_validate "https://sigs.interserver.net/interservertopline.db" "interservertopline.db" 500 || true
 
+# ── URLhaus (abuse.ch) ────────────────────────────────────────────────────────
+# Depuis le 21/10/2026 abuse.ch exige une clé d'authentification pour l'export
+# ClamAV (l'ancienne URL répond 410, le miroir malware-filter 404). La clé n'est
+# JAMAIS écrite dans ce hook : le fichier est pré-téléchargé sur la machine de
+# build quand ABUSECH_AUTH_KEY y est défini ; il est alors déjà dans $DB_DIR.
 echo ">>> [Hook TP] URLhaus…" | tee -a "$LOG"
-URLHAUS_OK=false
-for _url in \
-    "https://urlhaus.abuse.ch/downloads/urlhaus.ndb" \
-    "https://curbengh.github.io/malware-filter/urlhaus-filter-clam.ndb"; do
-    if install_and_validate "$_url" "urlhaus-filter.ndb" 1000; then
-        URLHAUS_OK=true; break
+if [[ -f "$DB_DIR/urlhaus-filter.ndb" ]]; then
+    if _db_ok; then
+        echo "  ✅ urlhaus-filter.ndb présent (pré-téléchargé avec la clé abuse.ch)" | tee -a "$LOG"
+    else
+        echo "  ⚠ urlhaus-filter.ndb incompatible avec la base — supprimé" | tee -a "$LOG"
+        rm -f "$DB_DIR/urlhaus-filter.ndb"
     fi
-done
-$URLHAUS_OK || echo "  ⚠ URLhaus inaccessible — ignoré." | tee -a "$LOG"
+else
+    echo "  ↷ URLhaus ignoré (clé abuse.ch requise — voir ABUSECH_AUTH_KEY)" | tee -a "$LOG"
+fi
 
+# ── Bilan final ───────────────────────────────────────────────────────────────
 TP_FINAL=$(find "$DB_DIR" \( \
     -name "*.ndb" -o -name "*.hdb" -o -name "*.hsb" \
     -o -name "*.db"  -o -name "*.ftm" -o -name "*.ldb" \
@@ -526,6 +554,7 @@ TP_FINAL=$(find "$DB_DIR" \( \
 
 echo ">>> [Hook TP] ✅ Terminé : $TP_OK installés, $TP_SKIP rejetés, $TP_FINAL fichier(s) tiers actifs." | tee -a "$LOG"
 
+# Vérification finale de cohérence
 if ! _db_ok; then
     echo ">>> [Hook TP] ❌ La base ne se charge toujours pas — purge totale des fichiers tiers." | tee -a "$LOG"
     find "$DB_DIR" \( -name "*.ndb" -o -name "*.hdb" -o -name "*.hsb" \
@@ -710,10 +739,18 @@ update-locale LANG=fr_FR.UTF-8 LC_ALL=fr_FR.UTF-8
 # ── Utilisateur kiosque (autologin, sudo sans mot de passe) ─────────────────
 # NOPASSWD est nécessaire : les 4 applications exigent root (os.geteuid()==0)
 # et sont lancées via `sudo -E python3 ...` par leurs wrappers respectifs.
+# Idempotent : groupe et utilisateur gérés séparément (un chroot réutilisé peut
+# déjà contenir le groupe sans l'utilisateur, ce qui fait échouer useradd).
+groupadd -f kiosk
 if ! id kiosk &>/dev/null; then
-    useradd -m -s /bin/bash -G sudo,plugdev,cdrom,dialout,libvirt,kvm kiosk
+    useradd -m -s /bin/bash -g kiosk kiosk
     echo "kiosk:kiosk" | chpasswd
+else
+    usermod --shell /bin/bash --gid kiosk kiosk
 fi
+for _g in sudo plugdev cdrom dialout libvirt kvm; do
+    getent group "$_g" >/dev/null && usermod --append --groups "$_g" kiosk || true
+done
 echo "kiosk ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/kiosk
 chmod 0440 /etc/sudoers.d/kiosk
 
@@ -833,7 +870,10 @@ mkdir -p /etc/X11/xorg.conf.d
 cat > /etc/X11/xorg.conf.d/99-kiosk-lock.conf << 'XORGCONF'
 Section "ServerFlags"
     Option "DontZap"       "true"
-    Option "DontVTSwitch"  "true"
+    # DontVTSwitch désactivé volontairement (comme dans forgeIso64.sh) : bloquer
+    # le changement de console (Ctrl+Alt+F2) empêche tout diagnostic en cas de
+    # plantage de la session.
+    Option "DontVTSwitch"  "false"
     Option "BlankTime"     "0"
     Option "StandbyTime"   "0"
     Option "SuspendTime"   "0"
@@ -862,63 +902,133 @@ EOF
 # sélection en boucle (relance uniquement en cas de crash).
 cat > /usr/local/bin/kiosk-menu-session.sh << 'SESSION'
 #!/bin/bash
+# Dispatcher live / installateur (aligné sur usb-antivirus-session.sh de Bastion)
 export DISPLAY=:0
+USER_NAME="$(id -un)"
 export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+export XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"
+install -d -m 0700 "$XDG_RUNTIME_DIR" 2>/dev/null || true
+chown "$USER_NAME:$USER_NAME" "$XDG_RUNTIME_DIR" 2>/dev/null || true
 
 xset s off -dpms 2>/dev/null || true
 xset s noblank   2>/dev/null || true
-
-openbox &
-OB_PID=$!
-sleep 1
-
 xsetroot -solid black 2>/dev/null || true
 
 if grep -q "installer=1" /proc/cmdline 2>/dev/null; then
     # ── Mode installateur ────────────────────────────────────────────────────
-    xterm -title "Borne Multiservices - Installation" \
+    exec xterm -title "Borne Multiservices - Installation" \
           -fa "Monospace" -fs 12 \
           -bg "#0d0d1a" -fg "#e0e0e0" \
           -e "sudo /usr/local/bin/install-to-disk.sh"
-else
-    # ── Mode live kiosque ────────────────────────────────────────────────────
+fi
+
+# ── Mode live kiosque ────────────────────────────────────────────────────────
+LOG_DIR="/var/log/kiosk-menu"
+if ! mkdir -p "$LOG_DIR" 2>/dev/null || [[ ! -w "$LOG_DIR" ]]; then
+    LOG_DIR="/tmp/kiosk-menu"
+    mkdir -p "$LOG_DIR" 2>/dev/null || true
+fi
+LOG_FILE="$LOG_DIR/session.log"
+
+# Toute la session (WM + menu) sous un vrai bus D-Bus de session.
+exec dbus-run-session -- bash -c '
+    openbox --replace >/tmp/openbox-kiosk.log 2>&1 &
+    OB_PID=$!
+    sleep 1
+    xsetroot -solid black 2>/dev/null || true
+
+    CRASH_COUNT=0
     while true; do
-        /usr/local/bin/kiosk-menu
-        [[ $? -eq 0 ]] && break
+        START_TS=$(date +%s)
+        /usr/local/bin/kiosk-menu >>"'"$LOG_FILE"'" 2>&1
+        RC=$?
+        END_TS=$(date +%s)
+        [[ $RC -eq 0 ]] && break
+
+        if (( END_TS - START_TS < 5 )); then
+            CRASH_COUNT=$((CRASH_COUNT + 1))
+        else
+            CRASH_COUNT=0
+        fi
+
+        if (( CRASH_COUNT >= 3 )); then
+            xterm -title "Borne Multiservices - ERREUR AU DEMARRAGE" \
+                  -fa "Monospace" -fs 12 \
+                  -bg "#3a0d0d" -fg "#f0f0f0" \
+                  -e "echo Menu arrêté avec le code $RC (x$CRASH_COUNT); \
+                      echo; echo Dernières lignes du log :; echo; \
+                      tail -n 60 '"$LOG_FILE"'; echo; \
+                      read -r -p \"Entrée pour réessayer...\"" || true
+            CRASH_COUNT=0
+        fi
         sleep 1
     done
 
     kill "$OB_PID" 2>/dev/null || true
     exec xfce4-session
-fi
-
-kill "$OB_PID" 2>/dev/null || true
+'
 SESSION
 chmod 755 /usr/local/bin/kiosk-menu-session.sh
 
 # ── Session pour le système INSTALLÉ (xfwm4, plus robuste en pérenne) ──────
 cat > /usr/local/bin/kiosk-menu-session-installed.sh << 'SESSION'
 #!/bin/bash
+# Session kiosque du système installé (xfwm4, aligné sur Bastion)
 export DISPLAY=:0
+USER_NAME="$(id -un)"
 export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+export XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"
+install -d -m 0700 "$XDG_RUNTIME_DIR" 2>/dev/null || true
+chown "$USER_NAME:$USER_NAME" "$XDG_RUNTIME_DIR" 2>/dev/null || true
 
 xset s off -dpms 2>/dev/null || true
 xset s noblank   2>/dev/null || true
-
 xsetroot -solid black 2>/dev/null || true
 
-xfwm4 --compositor=off &
-WM_PID=$!
-sleep 1
+LOG_DIR="/var/log/kiosk-menu"
+if ! mkdir -p "$LOG_DIR" 2>/dev/null || [[ ! -w "$LOG_DIR" ]]; then
+    LOG_DIR="/tmp/kiosk-menu"
+    mkdir -p "$LOG_DIR" 2>/dev/null || true
+fi
+LOG_FILE="$LOG_DIR/session.log"
 
-while true; do
-    /usr/local/bin/kiosk-menu
-    [[ $? -eq 0 ]] && break
+# Toute la session (WM + menu) sous un vrai bus D-Bus de session.
+exec dbus-run-session -- bash -c '
+    xfwm4 --compositor=off >/tmp/xfwm4-kiosk.log 2>&1 &
+    OB_PID=$!
     sleep 1
-done
+    xsetroot -solid black 2>/dev/null || true
 
-kill "$WM_PID" 2>/dev/null || true
-exec xfce4-session
+    CRASH_COUNT=0
+    while true; do
+        START_TS=$(date +%s)
+        /usr/local/bin/kiosk-menu >>"'"$LOG_FILE"'" 2>&1
+        RC=$?
+        END_TS=$(date +%s)
+        [[ $RC -eq 0 ]] && break
+
+        if (( END_TS - START_TS < 5 )); then
+            CRASH_COUNT=$((CRASH_COUNT + 1))
+        else
+            CRASH_COUNT=0
+        fi
+
+        if (( CRASH_COUNT >= 3 )); then
+            xterm -title "Borne Multiservices - ERREUR AU DEMARRAGE" \
+                  -fa "Monospace" -fs 12 \
+                  -bg "#3a0d0d" -fg "#f0f0f0" \
+                  -e "echo Menu arrêté avec le code $RC (x$CRASH_COUNT); \
+                      echo; echo Dernières lignes du log :; echo; \
+                      tail -n 60 '"$LOG_FILE"'; echo; \
+                      read -r -p \"Entrée pour réessayer...\"" || true
+            CRASH_COUNT=0
+        fi
+        sleep 1
+    done
+
+    kill "$OB_PID" 2>/dev/null || true
+    exec xfce4-session
+'
 SESSION
 chmod 755 /usr/local/bin/kiosk-menu-session-installed.sh
 
@@ -1130,11 +1240,29 @@ umount "$TARGET_MNT"
 whiptail --title "$TITLE" --msgbox \
 "✅  Installation terminée !
 
-Retirez le support live et redémarrez : la borne démarrera
-directement sur le menu de sélection installé sur $TARGET." \
-10 62
+Le poste va s'ÉTEINDRE complètement (démarrage à froid).
+Retirez le support live, puis rallumez la borne : elle
+démarrera directement sur le menu de sélection installé
+sur $TARGET." \
+12 62
+
+# Extinction complète (et non un redémarrage à chaud : un reboot laisse
+# l'écran de connexion LightDM au premier démarrage du système installé).
+sync
+whiptail --title "$TITLE" --infobox "Extinction du poste dans 5 secondes..." 5 50
+sleep 5
+systemctl poweroff || poweroff -f
 INSTALLER
 chmod 755 /usr/local/bin/install-to-disk.sh
+
+# chkrootkit : disponible en ligne de commande (sudo chkrootkit), mais jamais
+# lancé automatiquement (le paquet fournit un cron/timer quotidien).
+for _u in $(ls /usr/lib/systemd/system /lib/systemd/system 2>/dev/null \
+            | grep -E '^chkrootkit.*\.(timer|service)$' | sort -u); do
+    systemctl disable "$_u" 2>/dev/null || true
+done
+[ -f /etc/chkrootkit/chkrootkit.conf ] && \
+    sed -i 's/^RUN_DAILY=.*/RUN_DAILY="false"/' /etc/chkrootkit/chkrootkit.conf || true
 
 echo ">>> [Hook Système] OK ✅"
 HOOK
@@ -1296,10 +1424,87 @@ fi
 
 chown -R kiosk:kiosk /home/kiosk/ 2>/dev/null || true
 
+command -v chkrootkit >/dev/null 2>&1 \
+    || echo ">>> [Hook Permissions] ⚠ chkrootkit absent de l'image" >&2
+
 echo ">>> [Hook Permissions] OK ✅"
 HOOK
 chmod +x config/hooks/normal/0400-permissions.hook.chroot
 ok "Hook permissions créé"
+
+# =============================================================================
+# URLhaus (abuse.ch) : pré-téléchargement sur la machine de build
+# =============================================================================
+# Depuis le 21/10/2026 abuse.ch n'offre plus de téléchargement sans clé (410 Gone) ;
+# l'export ClamAV exige une clé d'authentification (« Auth-Key », gratuite, inscription
+# sur auth.abuse.ch — vérifier les conditions d'abuse.ch pour votre usage). Sans clé,
+# URLhaus est simplement ignoré. La clé n'est JAMAIS écrite dans un hook : le fichier
+# est déposé ici dans le chroot, et le hook 0150 le valide pendant lb build.
+# La clé passe par stdin (curl -K -) : elle n'apparaît ni dans la liste des
+# processus, ni dans les messages, ni dans les journaux.
+step "URLhaus (abuse.ch) : pré-téléchargement sur la machine de build..."
+CLAMAV_CHROOT="config/includes.chroot/var/lib/clamav"
+mkdir -p "$CLAMAV_CHROOT"
+
+_is_valid_clamav_file() {
+    local FILE="$1"
+    local HEADER
+    HEADER=$(head -c 64 "$FILE" 2>/dev/null)
+    case "$HEADER" in
+        '<'*|'HTTP/'*|'{"'*|'<!DOCTYPE'*|'<!doctype'*) return 1 ;;
+    esac
+    [[ -n "$HEADER" ]] || return 1
+    return 0
+}
+
+if [[ -n "${ABUSECH_AUTH_KEY:-}" ]]; then
+    if [[ ! "$ABUSECH_AUTH_KEY" =~ ^[A-Za-z0-9._~-]+$ ]]; then
+        warn "ABUSECH_AUTH_KEY invalide (lettres, chiffres, . _ ~ - uniquement) — URLhaus ignoré"
+    else
+        _UH_TMP="$(mktemp /tmp/urlhaus_XXXXXX)"
+        if printf 'url = "%s"\n' \
+               "https://urlhaus-api.abuse.ch/v2/files/exports/${ABUSECH_AUTH_KEY}/urlhaus_clamav.ndb" \
+           | curl -fsSL --connect-timeout 15 --max-time 120 -K - -o "$_UH_TMP" 2>/dev/null \
+           && [[ "$(stat -c%s "$_UH_TMP" 2>/dev/null || echo 0)" -ge 1000 ]] \
+           && _is_valid_clamav_file "$_UH_TMP"; then
+            mv "$_UH_TMP" "$CLAMAV_CHROOT/urlhaus-filter.ndb"
+            chmod 644 "$CLAMAV_CHROOT/urlhaus-filter.ndb"
+            ok "urlhaus-filter.ndb inclus ($(du -h "$CLAMAV_CHROOT/urlhaus-filter.ndb" | cut -f1)) — clé abuse.ch"
+        else
+            rm -f "$_UH_TMP"
+            warn "URLhaus : téléchargement refusé (clé invalide, expirée ou service indisponible) — ignoré"
+        fi
+    fi
+else
+    warn "URLhaus ignoré : abuse.ch exige une clé depuis le 21/10/2026 (sudo env ABUSECH_AUTH_KEY=… ./forgeIsoMenu64.sh)"
+fi
+
+# =============================================================================
+# LightDM autologin + règle polkit : aussi via includes.chroot (comme Bastion)
+# =============================================================================
+mkdir -p config/includes.chroot/etc/lightdm/lightdm.conf.d
+cat > config/includes.chroot/etc/lightdm/lightdm.conf.d/50-autologin.conf << 'EOF'
+[Seat:*]
+autologin-user=kiosk
+autologin-session=kiosk-menu
+autologin-user-timeout=0
+allow-guest=false
+EOF
+mkdir -p config/includes.chroot/etc/skel
+cat > config/includes.chroot/etc/skel/.dmrc << 'EOF'
+[Desktop]
+Session=kiosk-menu
+EOF
+mkdir -p config/includes.chroot/etc/polkit-1/rules.d
+cat > config/includes.chroot/etc/polkit-1/rules.d/49-kiosk-sudo.rules << 'EOF'
+polkit.addRule(function(action, subject) {
+    if (action.id.indexOf("org.freedesktop.policykit") === 0 &&
+        subject.isInGroup("sudo")) {
+        return polkit.Result.YES;
+    }
+});
+EOF
+ok "Autologin LightDM + règle polkit → includes.chroot"
 
 # =============================================================================
 # Copie du code des 4 applications + du menu de sélection

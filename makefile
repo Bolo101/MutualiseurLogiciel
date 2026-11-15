@@ -7,20 +7,23 @@ BUILD_DIR    := ./debian-live-build
 REPOS_DIR    := ./repos-src
 ISO_FILE     := borne-multiservices-v1.0.iso
 
+# Utilise sudo automatiquement si on n'est pas déjà root
+SUDO := $(if $(filter 0,$(shell id -u)),,sudo)
+
 .PHONY: all clean distclean help
 
 # Cible par défaut : clone les 4 dépôts et construit l'ISO.
 all:
-	chmod +x $(SCRIPT_ISO) && bash $(SCRIPT_ISO)
+	chmod +x $(SCRIPT_ISO) && $(SUDO) bash $(SCRIPT_ISO)
 
 # Supprime le répertoire de travail live-build et les dépôts clonés,
 # conserve l'ISO déjà générée.
 clean:
-	rm -rf $(BUILD_DIR) $(REPOS_DIR)
+	$(SUDO) rm -rf $(BUILD_DIR) $(REPOS_DIR)
 
 # Comme clean, mais supprime aussi l'ISO générée.
 distclean: clean
-	rm -f $(ISO_FILE)
+	$(SUDO) rm -f $(ISO_FILE)
 
 help:
 	@echo "Cibles disponibles :"
