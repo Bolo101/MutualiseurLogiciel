@@ -1240,9 +1240,18 @@ umount "$TARGET_MNT"
 whiptail --title "$TITLE" --msgbox \
 "✅  Installation terminée !
 
-Retirez le support live et redémarrez : la borne démarrera
-directement sur le menu de sélection installé sur $TARGET." \
-10 62
+Le poste va s'ÉTEINDRE complètement (démarrage à froid).
+Retirez le support live, puis rallumez la borne : elle
+démarrera directement sur le menu de sélection installé
+sur $TARGET." \
+12 62
+
+# Extinction complète (et non un redémarrage à chaud : un reboot laisse
+# l'écran de connexion LightDM au premier démarrage du système installé).
+sync
+whiptail --title "$TITLE" --infobox "Extinction du poste dans 5 secondes..." 5 50
+sleep 5
+systemctl poweroff || poweroff -f
 INSTALLER
 chmod 755 /usr/local/bin/install-to-disk.sh
 
