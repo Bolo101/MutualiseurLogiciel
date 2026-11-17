@@ -93,7 +93,7 @@ declare -A REPO_CODE_SUBDIR=(
     [bastion-antiviral]="code"
 )
 
-ISO_NAME="$(pwd)/borne-multiservices-v1.0.iso"
+ISO_NAME="$(pwd)/borne-multiservices-v1.1.iso"
 
 # Paramètres de boot communs (réutilisés dans syslinux + GRUB)
 BOOT_PARAMS="boot=live components quiet splash hostname=borne-multiservices username=kiosk locales=fr_FR.UTF-8 keyboard-layouts=fr noeject nopersistent"
@@ -1589,7 +1589,6 @@ mkdir -p config/includes.binary/boot/grub
 cat > config/includes.binary/boot/grub/grub.cfg << GRUBMENU
 set default=0
 set timeout=15
-
 if [ x\$feature_all_video_module = xy ]; then
   insmod all_video
 fi
